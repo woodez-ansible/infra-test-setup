@@ -1,0 +1,39 @@
+---
+# Time
+system_timezone: America/Toronto
+ntp_pools:
+  - 0.ca.pool.ntp.org
+  - 1.ca.pool.ntp.org
+  - 2.ca.pool.ntp.org
+  - 3.ca.pool.ntp.org
+
+postgres_version: 17
+postgres_port: 5432
+postgres_allowed_cidr: 192.168.2.0/24
+
+postgres_conf_dir: "/etc/postgresql/{{ postgres_version }}/main"
+
+# Application database and owner role
+app_db_name: appdb
+app_db_user: appuser
+
+# Tuning for 6 vCPU / 5.8 GB RAM / SSD
+postgres_max_connections: 100
+postgres_shared_buffers: 1536MB
+postgres_effective_cache_size: 4GB
+postgres_work_mem: 16MB
+postgres_maintenance_work_mem: 512MB
+postgres_wal_buffers: 16MB
+postgres_min_wal_size: 1GB
+postgres_max_wal_size: 4GB
+postgres_checkpoint_completion_target: 0.9
+postgres_random_page_cost: 1.1
+postgres_effective_io_concurrency: 200
+postgres_max_worker_processes: 6
+postgres_max_parallel_workers: 6
+postgres_max_parallel_workers_per_gather: 3
+postgres_max_parallel_maintenance_workers: 3
+
+# Secrets come from vault.yml
+postgres_superuser_password: "{{ vault_postgres_superuser_password }}"
+app_db_password: "{{ vault_app_db_password }}"

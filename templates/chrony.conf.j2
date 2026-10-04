@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+
+# Upstream time sources
+{% for pool in ntp_pools %}
+pool {{ pool }} iburst maxsources 2
+{% endfor %}
+
+# Extra sources from DHCP and drop-in directories (Ubuntu defaults)
+sourcedir /run/chrony-dhcp
+sourcedir /etc/chrony/sources.d
+confdir /etc/chrony/conf.d
+
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+ntsdumpdir /var/lib/chrony
+logdir /var/log/chrony
+
+# Step the clock if off by more than 1s during the first 3 updates
+makestep 1.0 3
+maxupdateskew 100.0
+
+# Keep the hardware clock in sync
+rtcsync
+
+leapsectz right/UTC
+
+# Client only: do not serve time to other hosts

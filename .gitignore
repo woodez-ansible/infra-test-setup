@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Ansible
+collections/
+group_vars/**/vault.yml.dec
+.vault_pass

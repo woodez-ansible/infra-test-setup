@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# Overrides for the stock postgresql.conf (loaded via include_dir = 'conf.d')
+
+# Connections
+listen_addresses = '*'
+port = {{ postgres_port }}
+max_connections = {{ postgres_max_connections }}
+password_encryption = scram-sha-256
+
+# Memory
+shared_buffers = {{ postgres_shared_buffers }}
+effective_cache_size = {{ postgres_effective_cache_size }}
+work_mem = {{ postgres_work_mem }}
+maintenance_work_mem = {{ postgres_maintenance_work_mem }}
+
+# WAL / checkpoints
+wal_buffers = {{ postgres_wal_buffers }}
+min_wal_size = {{ postgres_min_wal_size }}
+max_wal_size = {{ postgres_max_wal_size }}
+checkpoint_completion_target = {{ postgres_checkpoint_completion_target }}
+
+# Planner / IO
+random_page_cost = {{ postgres_random_page_cost }}
+effective_io_concurrency = {{ postgres_effective_io_concurrency }}
+
+# Parallelism
+max_worker_processes = {{ postgres_max_worker_processes }}
+max_parallel_workers = {{ postgres_max_parallel_workers }}
+max_parallel_workers_per_gather = {{ postgres_max_parallel_workers_per_gather }}
+max_parallel_maintenance_workers = {{ postgres_max_parallel_maintenance_workers }}
+
+# Time zone (initdb bakes in the zone at install time; keep it aligned with the host)
+timezone = '{{ system_timezone }}'
+log_timezone = '{{ system_timezone }}'
+
+# Logging
+log_connections = on
+log_disconnections = on
+log_line_prefix = '%m [%p] %q%u@%d from %h '

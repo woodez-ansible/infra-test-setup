@@ -1,0 +1,210 @@
+---
+- name: Install and configure PostgreSQL for remote access
+  hosts: dbservers
+  become: true
+
+  handlers:
+    - name: Restart chrony
+      ansible.builtin.service:
+        name: chrony
+        state: restarted
+
+    - name: Restart postgresql
+      ansible.builtin.service:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: restarted
+
+    - name: Reload postgresql
+      ansible.builtin.service:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: reloaded
+
+  pre_tasks:
+    - name: Ensure vault secrets are defined
+      ansible.builtin.assert:
+        that:
+          - vault_postgres_superuser_password is defined
+          - vault_app_db_password is defined
+          - "'CHANGE_ME' not in vault_postgres_superuser_password"
+          - "'CHANGE_ME' not in vault_app_db_password"
+        fail_msg: "Set real passwords in group_vars/dbservers/vault.yml (see vault.yml.example)."
+        quiet: true
+
+  tasks:
+    # ---------- Time ----------
+    - name: Set timezone to {{ system_timezone }}
+      community.general.timezone:
+        name: "{{ system_timezone }}"
+
+    - name: Install chrony (replaces systemd-timesyncd)
+      ansible.builtin.apt:
+        name: chrony
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Deploy chrony.conf
+      ansible.builtin.template:
+        src: ../templates/chrony.conf.j2
+        dest: /etc/chrony/chrony.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart chrony
+
+    - name: Ensure chrony is started and enabled
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Apply chrony config before checking sync
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for clock to synchronise
+      # 30 tries x 2s; max correction 0.1s
+      ansible.builtin.command: chronyc waitsync 30 0.1 0 2
+      changed_when: false
+
+    - name: Get chrony tracking status
+      ansible.builtin.command: chronyc tracking
+      register: chrony_tracking
+      changed_when: false
+
+    - name: Report time sync status
+      ansible.builtin.debug:
+        var: chrony_tracking.stdout_lines
+
+    # ---------- Packages ----------
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - acl            # needed for become_user to an unprivileged user
+          - ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Add PGDG apt repository
+      ansible.builtin.deb822_repository:
+        name: pgdg
+        types: deb
+        uris: https://apt.postgresql.org/pub/repos/apt
+        suites: "{{ ansible_facts['distribution_release'] }}-pgdg"
+        components: main
+        signed_by: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Install PostgreSQL {{ postgres_version }}
+      ansible.builtin.apt:
+        name:
+          - "postgresql-{{ postgres_version }}"
+          - "postgresql-client-{{ postgres_version }}"
+          - python3-psycopg2
+        state: present
+        update_cache: true
+
+    - name: Ensure PostgreSQL is started and enabled
+      ansible.builtin.service:
+        name: "postgresql@{{ postgres_version }}-main"
+        state: started
+        enabled: true
+
+    # ---------- Configuration ----------
+    - name: Ensure conf.d is included by postgresql.conf
+      ansible.builtin.lineinfile:
+        path: "{{ postgres_conf_dir }}/postgresql.conf"
+        regexp: "^#?include_dir\\s*="
+        line: "include_dir = 'conf.d'"
+      notify: Restart postgresql
+
+    - name: Deploy tuning and listen overrides
+      ansible.builtin.template:
+        src: ../templates/postgresql.conf.j2
+        dest: "{{ postgres_conf_dir }}/conf.d/99-ansible.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart postgresql
+
+    - name: Deploy pg_hba.conf
+      ansible.builtin.template:
+        src: ../templates/pg_hba.conf.j2
+        dest: "{{ postgres_conf_dir }}/pg_hba.conf"
+        owner: postgres
+        group: postgres
+        mode: "0640"
+      notify: Reload postgresql
+
+    - name: Apply config changes before managing roles
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Roles and databases ----------
+    - name: Set postgres superuser password
+      community.postgresql.postgresql_user:
+        name: postgres
+        password: "{{ postgres_superuser_password }}"
+      become_user: postgres
+      no_log: true
+
+    - name: Create application role
+      community.postgresql.postgresql_user:
+        name: "{{ app_db_user }}"
+        password: "{{ app_db_password }}"
+        role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE
+      become_user: postgres
+      no_log: true
+
+    - name: Create application database
+      community.postgresql.postgresql_db:
+        name: "{{ app_db_name }}"
+        owner: "{{ app_db_user }}"
+        encoding: UTF8
+        template: template0
+      become_user: postgres
+
+    # ---------- Firewall ----------
+    - name: Allow SSH through UFW (before enabling, to avoid lockout)
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Allow PostgreSQL from {{ postgres_allowed_cidr }}
+      community.general.ufw:
+        rule: allow
+        port: "{{ postgres_port | string }}"
+        proto: tcp
+        from_ip: "{{ postgres_allowed_cidr }}"
+        comment: postgresql
+
+    - name: Enable UFW with default deny incoming
+      community.general.ufw:
+        state: enabled
+        direction: incoming
+        policy: deny
+
+    # ---------- Verification ----------
+    - name: Wait for PostgreSQL to listen on the network interface
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ postgres_port }}"
+        timeout: 30
+
+    - name: Verify app user can log in over TCP
+      community.postgresql.postgresql_ping:
+        login_db: "{{ app_db_name }}"
+        login_host: "{{ ansible_host }}"
+        login_user: "{{ app_db_user }}"
+        login_password: "{{ app_db_password }}"
+        login_port: "{{ postgres_port }}"
+      become: false
+      register: pg_ping
+      failed_when: pg_ping is failed or not (pg_ping.is_available | default(false))
+      no_log: true
+
+    - name: Report server version
+      ansible.builtin.debug:
+        msg: "PostgreSQL {{ pg_ping.server_version.full | default('unknown') }} reachable at {{ ansible_host }}:{{ postgres_port }}"

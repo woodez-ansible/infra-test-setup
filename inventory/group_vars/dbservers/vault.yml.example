@@ -1,0 +1,4 @@
+---
+# Copy to vault.yml, set real values, then: ansible-vault encrypt group_vars/dbservers/vault.yml
+vault_postgres_superuser_password: "CHANGE_ME_postgres"
+vault_app_db_password: "CHANGE_ME_appuser"

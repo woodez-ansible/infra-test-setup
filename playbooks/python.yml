@@ -1,0 +1,48 @@
+---
+- name: Install Python 3, pip and virtualenv tooling
+  hosts: dbservers
+  become: true
+
+  tasks:
+    - name: Install Python packages
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-virtualenv
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ---------- Verification ----------
+    - name: Smoke-test venv and pip as the connection user
+      become: false
+      block:
+        - name: Create temp directory
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: venv-test
+          register: venv_tmp
+
+        - name: Create a throwaway venv
+          ansible.builtin.command: python3 -m venv "{{ venv_tmp.path }}/venv"
+          changed_when: false
+
+        - name: Collect tool versions
+          ansible.builtin.shell: |
+            python3 --version
+            "{{ venv_tmp.path }}/venv/bin/pip" --version
+            virtualenv --version
+          register: py_versions
+          changed_when: false
+
+        - name: Report tool versions
+          ansible.builtin.debug:
+            var: py_versions.stdout_lines
+      always:
+        - name: Remove temp directory
+          ansible.builtin.file:
+            path: "{{ venv_tmp.path }}"
+            state: absent
+          when: venv_tmp.path is defined
