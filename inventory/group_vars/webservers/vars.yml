@@ -1,0 +1,19 @@
+---
+webapp_name: apexkube
+webapp_repo: https://github.com/woodez/apexkube-company-web.git
+webapp_version: master            # branch, tag or commit SHA
+
+# TLS (Let's Encrypt, HTTP-01 via webroot; router forwards 80/443 to this host)
+webapp_domain: www.apexkube.xyz
+webapp_acme_root: /var/www/letsencrypt
+webapp_cert_dir: "/etc/letsencrypt/live/{{ webapp_domain }}"
+webapp_hsts: false                # enable once HTTPS is confirmed working
+
+webapp_user: apexkube             # system user that owns the source and runs the build
+webapp_home: /var/lib/apexkube
+webapp_src_dir: /opt/apexkube-web # git checkout + .venv
+webapp_www_dir: /var/www/apexkube # releases/<commit>/ + current symlink
+webapp_keep_releases: 3
+
+# Browser cache lifetime for CSS/JS/images (filenames are not content-hashed)
+webapp_asset_expires: 1d

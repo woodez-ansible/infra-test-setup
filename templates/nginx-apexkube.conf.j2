@@ -1,0 +1,95 @@
+# {{ ansible_managed }}
+
+# Cache policy by response type: HTML always revalidates, assets cache briefly
+map $sent_http_content_type ${{ webapp_name }}_expires {
+    default                   off;
+    ~^text/html               epoch;
+    ~^text/css                {{ webapp_asset_expires }};
+    ~javascript               {{ webapp_asset_expires }};
+    ~^image/                  {{ webapp_asset_expires }};
+}
+
+# Port 80: ACME challenges, everything else redirects to HTTPS
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    server_tokens off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ webapp_acme_root }};
+        default_type text/plain;
+    }
+
+    location / {
+        return 301 https://{{ webapp_domain }}$request_uri;
+    }
+}
+{% if webapp_tls_ready | bool %}
+
+# Port 443: refuse HTTPS for unknown hostnames / bare IP
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    ssl_reject_handshake on;
+}
+
+# Port 443: the site
+server {
+    # nginx 1.24 (Ubuntu 24.04) predates the separate "http2 on;" directive
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ webapp_domain }};
+
+    ssl_certificate     {{ webapp_cert_dir }}/fullchain.pem;
+    ssl_certificate_key {{ webapp_cert_dir }}/privkey.pem;
+
+    # Mozilla "intermediate" profile
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:{{ webapp_name }}_ssl:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    root {{ webapp_www_dir }}/current;
+    index index.html;
+
+    server_tokens off;
+    expires ${{ webapp_name }}_expires;
+
+{% if webapp_hsts | bool %}
+    add_header Strict-Transport-Security "max-age=63072000" always;
+{% endif %}
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 256;
+    gzip_types text/css application/javascript image/svg+xml;
+
+    access_log /var/log/nginx/{{ webapp_name }}.access.log;
+    error_log  /var/log/nginx/{{ webapp_name }}.error.log;
+
+    # Clean URLs: redirect old .html / index URLs (checks the original request, so
+    # try_files serving /services from services.html can't loop)
+    if ($request_uri ~ ^/(.*/)?index(?:\.html)?(?:\?|$)) {
+        return 301 /$1$is_args$args;
+    }
+    if ($request_uri ~ ^/(.+)\.html(?:\?|$)) {
+        return 301 /$1$is_args$args;
+    }
+
+    location / {
+        try_files $uri $uri.html $uri/ =404;
+    }
+
+    # Never serve dotfiles
+    location ~ /\. {
+        deny all;
+    }
+}
+{% endif %}

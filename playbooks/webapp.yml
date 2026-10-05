@@ -1,0 +1,247 @@
+---
+- name: Build and serve the ApexKube static site with nginx
+  hosts: webservers
+  become: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    # ---------- Packages ----------
+    - name: Install nginx and build prerequisites
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - certbot
+          - curl
+          - git
+          - python3-venv
+          - acl            # needed for become_user to an unprivileged user
+          - ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ---------- Build user ----------
+    - name: Create build user {{ webapp_user }}
+      ansible.builtin.user:
+        name: "{{ webapp_user }}"
+        system: true
+        home: "{{ webapp_home }}"
+        create_home: true
+        shell: /usr/sbin/nologin
+
+    - name: Create source directory
+      ansible.builtin.file:
+        path: "{{ webapp_src_dir }}"
+        state: directory
+        owner: "{{ webapp_user }}"
+        group: "{{ webapp_user }}"
+        mode: "0755"
+
+    # ---------- Source and build ----------
+    - name: Check out {{ webapp_repo }} @ {{ webapp_version }}
+      ansible.builtin.git:
+        repo: "{{ webapp_repo }}"
+        dest: "{{ webapp_src_dir }}"
+        version: "{{ webapp_version }}"
+        force: true
+      become_user: "{{ webapp_user }}"
+      register: webapp_git
+
+    - name: Set release paths
+      ansible.builtin.set_fact:
+        webapp_release: "{{ webapp_git.after[:12] }}"
+        webapp_release_dir: "{{ webapp_www_dir }}/releases/{{ webapp_git.after[:12] }}"
+
+    - name: Install build dependencies into venv
+      ansible.builtin.pip:
+        requirements: "{{ webapp_src_dir }}/requirements.txt"
+        virtualenv: "{{ webapp_src_dir }}/.venv"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ webapp_user }}"
+
+    - name: Check whether this commit is already released
+      ansible.builtin.stat:
+        path: "{{ webapp_release_dir }}"
+      register: webapp_release_stat
+
+    - name: Build site and stage release
+      when: not webapp_release_stat.stat.exists
+      block:
+        - name: Build site into dist/
+          ansible.builtin.command:
+            cmd: "{{ webapp_src_dir }}/.venv/bin/python build.py"
+            chdir: "{{ webapp_src_dir }}"
+          become_user: "{{ webapp_user }}"
+
+        - name: Create releases directory
+          ansible.builtin.file:
+            path: "{{ webapp_www_dir }}/releases"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Copy dist/ to release {{ webapp_release }}
+          ansible.builtin.copy:
+            src: "{{ webapp_src_dir }}/dist/"
+            dest: "{{ webapp_release_dir }}/"
+            remote_src: true
+            owner: root
+            group: root
+            mode: u=rwX,go=rX
+
+    - name: Point current at release {{ webapp_release }}
+      ansible.builtin.file:
+        src: "{{ webapp_release_dir }}"
+        dest: "{{ webapp_www_dir }}/current"
+        state: link
+        force: true
+
+    - name: Find releases
+      ansible.builtin.find:
+        paths: "{{ webapp_www_dir }}/releases"
+        file_type: directory
+      register: webapp_releases
+
+    - name: Remove old releases (keep {{ webapp_keep_releases }})
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ (webapp_releases.files | sort(attribute='mtime', reverse=true)
+            | map(attribute='path') | reject('equalto', webapp_release_dir)
+            | list)[webapp_keep_releases - 1:] }}
+
+    # ---------- Firewall ----------
+    - name: Allow SSH through UFW (before enabling, to avoid lockout)
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Allow HTTP and HTTPS from anywhere
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+        comment: "{{ webapp_name }} web"
+      loop: ["80", "443"]
+
+    - name: Remove retired port 8000 rule
+      community.general.ufw:
+        rule: allow
+        port: "8000"
+        proto: tcp
+        delete: true
+
+    - name: Ensure UFW is enabled with default deny incoming
+      community.general.ufw:
+        state: enabled
+        direction: incoming
+        policy: deny
+
+    # ---------- nginx (stage 1: HTTP, plus HTTPS if a cert already exists) ----------
+    - name: Disable stock default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Create ACME webroot
+      ansible.builtin.file:
+        path: "{{ webapp_acme_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check for existing certificate
+      ansible.builtin.stat:
+        path: "{{ webapp_cert_dir }}/fullchain.pem"
+      register: webapp_cert
+
+    - name: Record TLS state
+      ansible.builtin.set_fact:
+        webapp_tls_ready: "{{ webapp_cert.stat.exists }}"
+
+    - name: Configure nginx
+      ansible.builtin.include_tasks: tasks/nginx_site.yml
+
+    # ---------- Let's Encrypt ----------
+    - name: Create certbot deploy-hook directory
+      ansible.builtin.file:
+        path: /etc/letsencrypt/renewal-hooks/deploy
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload nginx after each certificate renewal
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+        content: |
+          #!/bin/sh
+          systemctl reload nginx
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Obtain certificate for {{ webapp_domain }}
+      ansible.builtin.command:
+        cmd: >-
+          certbot certonly --webroot -w {{ webapp_acme_root }}
+          -d {{ webapp_domain }}
+          --non-interactive --agree-tos --register-unsafely-without-email
+        creates: "{{ webapp_cert_dir }}/fullchain.pem"
+      register: webapp_certbot
+
+    - name: Ensure certbot renewal timer is enabled
+      ansible.builtin.service:
+        name: certbot.timer
+        state: started
+        enabled: true
+
+    # ---------- nginx (stage 2: enable HTTPS after first issuance) ----------
+    - name: Enable HTTPS now that the certificate exists
+      when: webapp_certbot is changed
+      block:
+        - name: Record TLS state
+          ansible.builtin.set_fact:
+            webapp_tls_ready: true
+
+        - name: Reconfigure nginx with HTTPS
+          ansible.builtin.include_tasks: tasks/nginx_site.yml
+
+    # ---------- Verification (from the host; avoids router hairpin NAT) ----------
+    - name: Fetch site over HTTPS with certificate validation
+      ansible.builtin.command: >-
+        curl -fsS --max-time 10
+        --resolve {{ webapp_domain }}:443:127.0.0.1
+        https://{{ webapp_domain }}/
+      register: webapp_https
+      changed_when: false
+      failed_when: webapp_https.rc != 0 or 'ApexKube' not in webapp_https.stdout
+
+    - name: Check HTTP redirects to HTTPS
+      ansible.builtin.command: >-
+        curl -sS --max-time 10 -o /dev/null -w '%{http_code} %{redirect_url}'
+        --resolve {{ webapp_domain }}:80:127.0.0.1
+        http://{{ webapp_domain }}/
+      register: webapp_redirect
+      changed_when: false
+      failed_when: webapp_redirect.stdout != '301 https://' ~ webapp_domain ~ '/'
+
+    - name: Read certificate expiry
+      ansible.builtin.command: openssl x509 -enddate -noout -in {{ webapp_cert_dir }}/fullchain.pem
+      register: webapp_cert_expiry
+      changed_when: false
+
+    - name: Report deployed release
+      ansible.builtin.debug:
+        msg:
+          - "{{ webapp_name }} {{ webapp_release }} live at https://{{ webapp_domain }}/"
+          - "Certificate {{ webapp_cert_expiry.stdout }}"

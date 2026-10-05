@@ -62,6 +62,46 @@ packages inside a venv:
 python3 -m venv ~/myenv && source ~/myenv/bin/activate && pip install <pkg>
 ```
 
+### Web app (https://www.apexkube.xyz)
+
+`playbooks/webapp.yml` clones
+[apexkube-company-web](https://github.com/woodez/apexkube-company-web), builds the
+static site with its own venv as the `apexkube` system user, and serves it with
+nginx over HTTPS on 443 using a Let's Encrypt certificate. Port 80 only answers
+Let's Encrypt checks and redirects everything else to HTTPS.
+
+**Prerequisites**
+
+- Router forwards TCP **80** and **443** to `192.168.2.174`.
+- `www.apexkube.xyz` resolves to your public IP (currently a CNAME to
+  `mydev.dyndns.org`).
+- Optional: at register.com, URL-forward `apexkube.xyz` to
+  `https://www.apexkube.xyz` (the cert covers `www` only).
+
+```bash
+ansible-playbook playbooks/webapp.yml
+```
+
+The first run starts nginx on port 80, requests the certificate, then enables
+443. The run checks HTTPS and the HTTP redirect from db01 itself. To test from
+outside, use a phone on cellular: many routers can't reach their own public IP
+from inside the LAN.
+
+- **Update:** re-run the playbook. It pulls `master`; a new commit is built into
+  `/var/www/apexkube/releases/<commit>/` and `current` is switched to it. No new
+  commit means no rebuild. The newest 3 releases are kept.
+- **Pin / roll back:** set `webapp_version` in
+  `inventory/group_vars/webservers/vars.yml` to a commit SHA or tag and re-run.
+- **Layout on the host:** source + venv in `/opt/apexkube-web`, served files in
+  `/var/www/apexkube/current`, nginx config in `/etc/nginx/sites-available/apexkube`,
+  logs in `/var/log/nginx/apexkube.*.log`, certificate in
+  `/etc/letsencrypt/live/www.apexkube.xyz/`.
+- **Renewal:** automatic via `certbot.timer`; a deploy hook reloads nginx.
+  Test with `sudo certbot renew --dry-run` on db01.
+- **HSTS:** once HTTPS has worked reliably for a while, set `webapp_hsts: true`
+  and re-run. Browsers then refuse plain HTTP for the site for 2 years, so only
+  turn it on when you're sure.
+
 ### Connect
 
 ```bash

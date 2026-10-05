@@ -1,0 +1,31 @@
+---
+# Deploy the nginx site config, validate it and apply it.
+# Expects webapp_tls_ready to be set (includes the 443 blocks when true).
+- name: Deploy site config (TLS {{ 'on' if webapp_tls_ready else 'off' }})
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/../templates/nginx-apexkube.conf.j2"
+    dest: "/etc/nginx/sites-available/{{ webapp_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Enable site
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ webapp_name }}"
+    dest: "/etc/nginx/sites-enabled/{{ webapp_name }}"
+    state: link
+  notify: Reload nginx
+
+- name: Validate nginx config
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Ensure nginx is started and enabled
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Apply nginx changes
+  ansible.builtin.meta: flush_handlers
