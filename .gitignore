@@ -227,3 +227,7 @@ __marimo__/
 collections/
 group_vars/**/vault.yml.dec
 .vault_pass
+
+# Local-only docs
+CLAUDE.md
+k8-plan.md
