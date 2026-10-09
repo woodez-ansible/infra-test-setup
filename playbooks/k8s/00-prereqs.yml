@@ -1,0 +1,153 @@
+---
+- name: "Phase 0: OS prerequisites for Kubernetes"
+  hosts: k8s_cluster
+  become: true
+
+  handlers:
+    - name: Restart chrony
+      ansible.builtin.service:
+        name: chrony
+        state: restarted
+
+  tasks:
+    # ---------- Disk ----------
+    - name: Grow root LV to use all free space in ubuntu-vg
+      community.general.lvol:
+        vg: ubuntu-vg
+        lv: ubuntu-lv
+        size: +100%FREE
+        resizefs: true
+      when: (ansible_facts['lvm']['vgs']['ubuntu-vg']['free_g'] | default(0) | float) > 1
+
+    # ---------- Names ----------
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Add cluster nodes and API alias to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED: k8s cluster"
+        block: |
+          {{ k8s_api_ip }} {{ k8s_api_name }}
+          {% for h in groups['k8s_cluster'] %}
+          {{ hostvars[h].ansible_host }} {{ h }}
+          {% endfor %}
+
+    # ---------- Swap ----------
+    - name: Turn swap off now
+      ansible.builtin.command: swapoff -a
+      when: ansible_facts['swaptotal_mb'] > 0
+      changed_when: true
+
+    - name: Remove swap entries from /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#]\S*\s+\S+\s+swap\s'
+        state: absent
+
+    - name: Delete swap file
+      ansible.builtin.file:
+        path: /swap.img
+        state: absent
+
+    # ---------- Kernel ----------
+    - name: Load and persist kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+        persistent: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Set Kubernetes sysctls
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_file: /etc/sysctl.d/99-k8s.conf
+        reload: true
+      loop:
+        - net.ipv4.ip_forward
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+
+    # ---------- Packages ----------
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - conntrack
+          - socat
+          - ipset
+          - ethtool
+          - chrony
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Python Kubernetes client (for Ansible k8s modules)
+      ansible.builtin.apt:
+        name: python3-kubernetes
+        state: present
+      when: inventory_hostname in groups['k8s_control_plane']
+
+    # ---------- Time ----------
+    - name: Set timezone to {{ system_timezone }}
+      community.general.timezone:
+        name: "{{ system_timezone }}"
+
+    - name: Deploy chrony.conf
+      ansible.builtin.template:
+        src: "{{ repo_templates }}/chrony.conf.j2"
+        dest: /etc/chrony/chrony.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart chrony
+
+    - name: Ensure chrony is started and enabled
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Apply chrony config
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Checks ----------
+    - name: Wait for clock to synchronise
+      ansible.builtin.command: chronyc waitsync 30 0.1 0 2
+      changed_when: false
+
+    - name: Gather post-change state
+      ansible.builtin.shell: |
+        set -e
+        echo "root: $(df -h / | awk 'NR==2{print $2}')"
+        echo "swap: $(swapon --show --noheadings | wc -l) active"
+        echo "modules: $(lsmod | grep -cE '^(overlay|br_netfilter) ')/2"
+        echo "ip_forward: $(sysctl -n net.ipv4.ip_forward)"
+        for h in {{ groups['k8s_cluster'] | join(' ') }} {{ k8s_api_name }}; do
+          getent hosts "$h" | grep -v '^127\.' | awk -v h="$h" '{print "resolve " h ": " $1}' | head -n 1
+        done
+      args:
+        executable: /bin/bash
+      register: prereq_state
+      changed_when: false
+
+    - name: Verify prerequisites
+      ansible.builtin.assert:
+        that:
+          - "'swap: 0 active' in prereq_state.stdout"
+          - "'modules: 2/2' in prereq_state.stdout"
+          - "'ip_forward: 1' in prereq_state.stdout"
+          - prereq_state.stdout_lines | select('match', '^resolve ') | list | length == (groups['k8s_cluster'] | length) + 1
+        fail_msg: "{{ prereq_state.stdout_lines }}"
+        quiet: true
+
+    - name: Report node state
+      ansible.builtin.debug:
+        var: prereq_state.stdout_lines

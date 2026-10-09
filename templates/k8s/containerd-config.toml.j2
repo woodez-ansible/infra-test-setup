@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+# containerd 2.x (config version 3). Unset options keep containerd defaults.
+version = 3
+
+[plugins.'io.containerd.cri.v1.images'.pinned_images]
+  sandbox = "registry.k8s.io/pause:{{ k8s_pause_version }}"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options]
+  SystemdCgroup = true

@@ -1,0 +1,65 @@
+---
+- name: "Phase 5: join workers"
+  hosts: k8s_workers
+  become: true
+
+  vars:
+    cp_host: "{{ groups['k8s_control_plane'][0] }}"
+
+  tasks:
+    - name: Check whether this node has already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join cluster
+      when: not kubelet_conf.stat.exists
+      block:
+        - name: Create a short-lived join command on the control plane
+          ansible.builtin.command: kubeadm token create --ttl 30m --print-join-command
+          delegate_to: "{{ cp_host }}"
+          register: join_cmd
+          changed_when: true
+          no_log: true
+
+        - name: kubeadm join
+          ansible.builtin.command: "{{ join_cmd.stdout }}"
+          changed_when: true
+          no_log: true
+
+    - name: Label worker role
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        state: patched
+        definition:
+          metadata:
+            labels:
+              node-role.kubernetes.io/worker: ""
+      delegate_to: "{{ cp_host }}"
+
+    - name: Wait for {{ inventory_hostname }} to be Ready
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+      delegate_to: "{{ cp_host }}"
+
+- name: Report cluster nodes
+  hosts: k8s_control_plane
+  become: true
+  tasks:
+    - name: List nodes
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Show nodes
+      ansible.builtin.debug:
+        var: nodes.stdout_lines

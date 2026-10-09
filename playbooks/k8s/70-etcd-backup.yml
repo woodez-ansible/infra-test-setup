@@ -1,0 +1,74 @@
+---
+- name: "Phase 7: daily etcd + PKI backups"
+  hosts: k8s_control_plane
+  become: true
+
+  tasks:
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ etcd_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install backup script
+      ansible.builtin.template:
+        src: "{{ repo_templates }}/k8s/etcd-backup.sh.j2"
+        dest: /usr/local/sbin/etcd-backup
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/etcd-backup.service
+        content: |
+          [Unit]
+          Description=Snapshot etcd and archive Kubernetes PKI
+          After=kubelet.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/etcd-backup
+        mode: "0644"
+
+    - name: Install systemd timer (daily)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/etcd-backup.timer
+        content: |
+          [Unit]
+          Description=Daily etcd backup
+
+          [Timer]
+          OnCalendar=*-*-* 02:30:00
+          RandomizedDelaySec=15m
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        mode: "0644"
+
+    - name: Enable backup timer
+      ansible.builtin.systemd_service:
+        name: etcd-backup.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    # ---------- Check ----------
+    - name: Run a backup now
+      ansible.builtin.systemd_service:
+        name: etcd-backup.service
+        state: started
+      changed_when: true
+
+    - name: Show latest backup log
+      ansible.builtin.command: journalctl -u etcd-backup.service -n 15 --no-pager -o cat
+      register: backup_log
+      changed_when: false
+      failed_when: "'backup ok:' not in backup_log.stdout"
+
+    - name: Report backup
+      ansible.builtin.debug:
+        var: backup_log.stdout_lines

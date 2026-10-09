@@ -1,0 +1,11 @@
+---
+# Full cluster build, in phase order. Each phase is idempotent and can also be run alone.
+- import_playbook: k8s/00-prereqs.yml
+- import_playbook: k8s/10-containerd.yml
+- import_playbook: k8s/20-kube-packages.yml
+- import_playbook: k8s/30-control-plane.yml
+- import_playbook: k8s/40-calico.yml
+- import_playbook: k8s/50-workers.yml
+- import_playbook: k8s/60-addons.yml
+- import_playbook: k8s/70-etcd-backup.yml
+- import_playbook: k8s/90-smoke-test.yml

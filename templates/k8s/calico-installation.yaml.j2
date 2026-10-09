@@ -1,0 +1,30 @@
+# {{ ansible_managed }}
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    bgp: Disabled
+    ipPools:
+      - name: default-ipv4-ippool
+        cidr: {{ k8s_pod_cidr }}
+        blockSize: 26
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
+        # Operator defaults, stated explicitly: ipPools is replaced as a whole on
+        # apply, so omitting them makes every run strip and re-add them.
+        allowedUses: [Workload, Tunnel]
+        assignmentMode: Automatic
+        disableBGPExport: false
+        disableNewAllocations: false
+    nodeAddressAutodetectionV4:
+      cidrs:
+        - {{ k8s_lan_cidr }}
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}

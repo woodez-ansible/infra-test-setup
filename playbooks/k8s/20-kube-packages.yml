@@ -1,0 +1,51 @@
+---
+- name: "Phase 2: kubelet, kubeadm, kubectl"
+  hosts: k8s_cluster
+  become: true
+
+  tasks:
+    - name: Add Kubernetes v{{ k8s_minor }} apt repository
+      ansible.builtin.deb822_repository:
+        name: kubernetes
+        types: deb
+        uris: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/"
+        suites: /
+        signed_by: "https://pkgs.k8s.io/core:/stable:/v{{ k8s_minor }}/deb/Release.key"
+        state: present
+
+    - name: Install kubelet, kubeadm, kubectl {{ k8s_version }}
+      ansible.builtin.apt:
+        name:
+          - "kubelet={{ k8s_version }}-*"
+          - "kubeadm={{ k8s_version }}-*"
+          - "kubectl={{ k8s_version }}-*"
+          - cri-tools      # crictl; no longer pulled in by kubeadm, used by etcd backups
+        state: present
+        update_cache: true
+        allow_change_held_packages: true
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    - name: Set kubelet node IP
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS="--node-ip={{ ansible_host }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable kubelet (crash-loops until kubeadm configures it; expected)
+      ansible.builtin.service:
+        name: kubelet
+        enabled: true
+
+    - name: Check kubeadm version
+      ansible.builtin.command: kubeadm version -o short
+      register: kubeadm_ver
+      changed_when: false
+      failed_when: kubeadm_ver.stdout != 'v' ~ k8s_version

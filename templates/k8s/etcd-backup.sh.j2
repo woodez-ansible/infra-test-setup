@@ -1,0 +1,30 @@
+#!/bin/sh
+# {{ ansible_managed }}
+# Snapshot etcd (via etcdctl inside the etcd static pod) and archive the PKI.
+set -eu
+
+dir={{ etcd_backup_dir }}
+keep={{ etcd_backup_keep }}
+ts=$(date +%Y%m%d-%H%M%S)
+tmp=/var/lib/etcd/backup-snapshot.db   # /var/lib/etcd is mounted into the etcd pod
+
+cid=$(crictl ps --name '^etcd$' -q | head -n 1)
+[ -n "$cid" ] || { echo "etcd container not found" >&2; exit 1; }
+
+crictl exec "$cid" etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save "$tmp"
+crictl exec "$cid" etcdutl snapshot status "$tmp" -w table
+
+mkdir -p "$dir"
+mv "$tmp" "$dir/etcd-$ts.db"
+tar -czf "$dir/pki-$ts.tgz" -C /etc/kubernetes pki
+chmod 600 "$dir/etcd-$ts.db" "$dir/pki-$ts.tgz"
+
+# Keep the newest $keep of each
+ls -1t "$dir"/etcd-*.db  | tail -n +$((keep + 1)) | xargs -r rm -f
+ls -1t "$dir"/pki-*.tgz  | tail -n +$((keep + 1)) | xargs -r rm -f
+echo "backup ok: $dir/etcd-$ts.db"

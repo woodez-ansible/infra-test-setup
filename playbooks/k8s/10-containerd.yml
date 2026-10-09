@@ -1,0 +1,68 @@
+---
+- name: "Phase 1: container runtime (containerd)"
+  hosts: k8s_cluster
+  become: true
+
+  handlers:
+    - name: Restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+  tasks:
+    - name: Install containerd and runc
+      ansible.builtin.apt:
+        name:
+          - containerd
+          - runc
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create containerd config directory
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Deploy containerd config (systemd cgroups, pinned pause image)
+      ansible.builtin.template:
+        src: "{{ repo_templates }}/k8s/containerd-config.toml.j2"
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart containerd
+
+    - name: Point crictl at containerd
+      ansible.builtin.copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure containerd is started and enabled
+      ansible.builtin.service:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Apply containerd config
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read effective containerd config
+      ansible.builtin.command: containerd config dump
+      register: containerd_dump
+      changed_when: false
+
+    - name: Verify systemd cgroup driver and pause image
+      ansible.builtin.assert:
+        that:
+          - containerd_dump.stdout is search('SystemdCgroup = true')
+          - containerd_dump.stdout is search('pause:' ~ k8s_pause_version)
+        fail_msg: containerd config did not apply as expected
+        quiet: true

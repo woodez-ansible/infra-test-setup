@@ -1,0 +1,93 @@
+---
+- name: "Phase 4: pod network (Calico)"
+  hosts: k8s_control_plane
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  vars:
+    calico_base: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests"
+    manifest_dir: /opt/k8s-manifests/calico-{{ calico_version }}
+
+  tasks:
+    - name: Create manifest directory
+      ansible.builtin.file:
+        path: "{{ manifest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Tigera operator manifests
+      ansible.builtin.get_url:
+        url: "{{ calico_base }}/{{ item }}"
+        dest: "{{ manifest_dir }}/{{ item }}"
+        mode: "0644"
+      loop:
+        - operator-crds.yaml
+        - tigera-operator.yaml
+
+    - name: Apply Tigera operator CRDs and operator (server-side; CRDs are large)
+      kubernetes.core.k8s:
+        src: "{{ manifest_dir }}/{{ item }}"
+        state: present
+        apply: true
+        server_side_apply:
+          field_manager: ansible
+          force_conflicts: true
+      loop:
+        - operator-crds.yaml
+        - tigera-operator.yaml
+
+    - name: Wait for Tigera operator
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: tigera-operator
+        namespace: tigera-operator
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+
+    - name: Apply Calico Installation (VXLAN, BGP off, pod CIDR {{ k8s_pod_cidr }})
+      kubernetes.core.k8s:
+        definition: "{{ lookup('template', repo_templates ~ '/k8s/calico-installation.yaml.j2') | from_yaml_all | list }}"
+        state: present
+        apply: true
+        # Server-side apply: the operator fills in defaults, which client-side apply sees as drift
+        server_side_apply:
+          field_manager: ansible
+          force_conflicts: true
+
+    # ---------- Checks ----------
+    - name: Wait for Calico to report Available
+      kubernetes.core.k8s_info:
+        api_version: operator.tigera.io/v1
+        kind: TigeraStatus
+        name: calico
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 600
+
+    - name: Wait for {{ inventory_hostname }} to be Ready
+      kubernetes.core.k8s_info:
+        kind: Node
+        name: "{{ inventory_hostname }}"
+        wait: true
+        wait_condition:
+          type: Ready
+          status: "True"
+        wait_timeout: 300
+
+    - name: Wait for CoreDNS
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        name: coredns
+        namespace: kube-system
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300

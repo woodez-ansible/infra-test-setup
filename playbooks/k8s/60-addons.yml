@@ -1,0 +1,164 @@
+---
+- name: "Phase 6: add-ons (Helm, MetalLB, Envoy Gateway, local-path)"
+  hosts: k8s_control_plane
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: /etc/kubernetes/admin.conf
+    group/kubernetes.core.helm:
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  vars:
+    manifest_dir: /opt/k8s-manifests
+
+  tasks:
+    # ---------- Helm ----------
+    - name: Check installed Helm version
+      ansible.builtin.command: helm version --short
+      register: helm_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install Helm {{ helm_version }}
+      when: helm_installed.rc != 0 or not helm_installed.stdout.startswith(helm_version)
+      block:
+        - name: Download Helm (checksum-verified)
+          ansible.builtin.get_url:
+            url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+            dest: "/tmp/helm-{{ helm_version }}.tar.gz"
+            checksum: "sha256:{{ helm_sha256 }}"
+            mode: "0644"
+
+        - name: Unpack Helm
+          ansible.builtin.unarchive:
+            src: "/tmp/helm-{{ helm_version }}.tar.gz"
+            dest: /tmp
+            remote_src: true
+
+        - name: Install helm binary
+          ansible.builtin.copy:
+            src: /tmp/linux-amd64/helm
+            dest: /usr/local/bin/helm
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0755"
+
+    # ---------- MetalLB ----------
+    - name: Create metallb-system namespace (privileged; speaker uses host network)
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: metallb-system
+            labels:
+              pod-security.kubernetes.io/enforce: privileged
+              pod-security.kubernetes.io/audit: privileged
+              pod-security.kubernetes.io/warn: privileged
+
+    - name: Add MetalLB chart repo
+      kubernetes.core.helm_repository:
+        name: metallb
+        repo_url: https://metallb.github.io/metallb
+
+    - name: Install MetalLB {{ metallb_chart_version }}
+      kubernetes.core.helm:
+        name: metallb
+        chart_ref: metallb/metallb
+        chart_version: "{{ metallb_chart_version }}"
+        release_namespace: metallb-system
+        update_repo_cache: true
+        values:
+          # FRR-K8s is only needed for BGP; this cluster uses L2 announcements
+          frrk8s:
+            enabled: false
+        wait: true
+        wait_timeout: 10m
+
+    - name: Configure MetalLB address pool {{ metallb_pool }}
+      kubernetes.core.k8s:
+        definition: "{{ lookup('template', repo_templates ~ '/k8s/metallb-pool.yaml.j2') | from_yaml_all | list }}"
+        apply: true
+      register: metallb_pool_result
+      # The admission webhook can lag a few seconds behind the controller becoming Ready
+      until: metallb_pool_result is succeeded
+      retries: 10
+      delay: 6
+
+    # ---------- Envoy Gateway ----------
+    - name: Install Envoy Gateway {{ envoy_gateway_version }} (includes Gateway API CRDs)
+      kubernetes.core.helm:
+        name: eg
+        chart_ref: oci://docker.io/envoyproxy/gateway-helm
+        chart_version: "{{ envoy_gateway_version }}"
+        release_namespace: envoy-gateway-system
+        create_namespace: true
+        wait: true
+        wait_timeout: 10m
+
+    - name: Create GatewayClass and shared Gateway
+      kubernetes.core.k8s:
+        definition: "{{ lookup('template', repo_templates ~ '/k8s/envoy-gateway.yaml.j2') | from_yaml_all | list }}"
+        apply: true
+
+    # ---------- local-path-provisioner ----------
+    - name: Create manifest directory
+      ansible.builtin.file:
+        path: "{{ manifest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download local-path-provisioner {{ local_path_version }}
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ local_path_version }}/deploy/local-path-storage.yaml"
+        dest: "{{ manifest_dir }}/local-path-storage-{{ local_path_version }}.yaml"
+        mode: "0644"
+
+    - name: Apply local-path-provisioner
+      kubernetes.core.k8s:
+        src: "{{ manifest_dir }}/local-path-storage-{{ local_path_version }}.yaml"
+        apply: true
+
+    - name: Make local-path the default StorageClass
+      kubernetes.core.k8s:
+        kind: StorageClass
+        name: local-path
+        state: patched
+        definition:
+          metadata:
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+
+    # ---------- Checks ----------
+    - name: Wait for add-on deployments
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ item.ns }}"
+        name: "{{ item.name }}"
+        wait: true
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_timeout: 300
+      loop:
+        - { ns: metallb-system, name: metallb-controller }
+        - { ns: envoy-gateway-system, name: envoy-gateway }
+        - { ns: local-path-storage, name: local-path-provisioner }
+
+    - name: Wait for the public Gateway to be Programmed
+      kubernetes.core.k8s_info:
+        api_version: gateway.networking.k8s.io/v1
+        kind: Gateway
+        name: public
+        namespace: gateway
+        wait: true
+        wait_condition:
+          type: Programmed
+          status: "True"
+        wait_timeout: 300
+      register: gw
+
+    - name: Report Gateway address
+      ansible.builtin.debug:
+        msg: "Gateway 'public' address: {{ gw.resources[0].status.addresses | map(attribute='value') | join(', ') }}"

@@ -110,3 +110,38 @@ psql -h 192.168.2.174 -U appuser appdb
 
 Change passwords later with `ansible-vault edit inventory/group_vars/dbservers/vault.yml`
 and re-run the playbook. Tunables live in `inventory/group_vars/dbservers/vars.yml`.
+
+## Kubernetes cluster (master / kube01 / kube02)
+
+kubeadm cluster: Kubernetes v1.37.1, containerd, Calico (VXLAN), MetalLB
+(`192.168.2.240-250`), Envoy Gateway and local-path storage. The design and the
+reasons for each choice are in [k8-plan.md](k8-plan.md). Versions are pinned in
+`inventory/group_vars/k8s_cluster/vars.yml`.
+
+```bash
+source .venv/bin/activate
+ansible-galaxy collection install -r requirements.yml -p ./collections
+
+# Run one phase at a time; each ends with its own checks
+ansible-playbook playbooks/k8s/00-prereqs.yml      # disk, swap, kernel, hosts, time
+ansible-playbook playbooks/k8s/10-containerd.yml
+ansible-playbook playbooks/k8s/20-kube-packages.yml
+ansible-playbook playbooks/k8s/30-control-plane.yml
+ansible-playbook playbooks/k8s/40-calico.yml
+ansible-playbook playbooks/k8s/50-workers.yml
+ansible-playbook playbooks/k8s/60-addons.yml
+ansible-playbook playbooks/k8s/70-etcd-backup.yml
+ansible-playbook playbooks/k8s/90-smoke-test.yml   # add -e keep_smoke_test=true to inspect
+
+ansible-playbook playbooks/k8s.yml                 # or everything, in order (idempotent)
+```
+
+- **kubectl from the Mac:** `export KUBECONFIG=~/.kube/homelab.conf`. Phase 3
+  writes this file; it holds cluster-admin credentials and is not in the repo.
+  On `master`, `kubectl` works as kwood with no setup.
+- **Expose an app:** create an `HTTPRoute` with `parentRefs: [{name: public,
+  namespace: gateway}]`. The Gateway's IP is shown by
+  `kubectl -n gateway get gateway public`.
+- **Backups:** `/var/backups/etcd/` on master holds daily etcd snapshots and PKI
+  archives, newest 7 of each. Run one now with `sudo systemctl start etcd-backup`.
+- **Tear down:** `ansible-playbook playbooks/k8s/99-reset.yml -e confirm_reset=yes`.

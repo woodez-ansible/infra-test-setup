@@ -1,0 +1,159 @@
+---
+- name: "Phase 8: end-to-end smoke test"
+  hosts: k8s_control_plane
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  vars:
+    ns: smoke-test
+
+  tasks:
+    - name: Run smoke test
+      block:
+        - name: Create workload, Service, HTTPRoute, PVC and DNS job
+          kubernetes.core.k8s:
+            apply: true
+            definition:
+              - apiVersion: v1
+                kind: Namespace
+                metadata: { name: "{{ ns }}" }
+
+              - apiVersion: apps/v1
+                kind: Deployment
+                metadata: { name: web, namespace: "{{ ns }}" }
+                spec:
+                  replicas: 2
+                  selector: { matchLabels: { app: web } }
+                  template:
+                    metadata: { labels: { app: web } }
+                    spec:
+                      topologySpreadConstraints:
+                        - maxSkew: 1
+                          topologyKey: kubernetes.io/hostname
+                          whenUnsatisfiable: DoNotSchedule
+                          labelSelector: { matchLabels: { app: web } }
+                      containers:
+                        - name: nginx
+                          image: nginx:stable-alpine
+                          ports: [{ containerPort: 80 }]
+
+              - apiVersion: v1
+                kind: Service
+                metadata: { name: web, namespace: "{{ ns }}" }
+                spec:
+                  selector: { app: web }
+                  ports: [{ port: 80, targetPort: 80 }]
+
+              - apiVersion: gateway.networking.k8s.io/v1
+                kind: HTTPRoute
+                metadata: { name: web, namespace: "{{ ns }}" }
+                spec:
+                  parentRefs: [{ name: public, namespace: gateway }]
+                  rules:
+                    - backendRefs: [{ name: web, port: 80 }]
+
+              - apiVersion: v1
+                kind: PersistentVolumeClaim
+                metadata: { name: data, namespace: "{{ ns }}" }
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources: { requests: { storage: 1Gi } }
+
+              - apiVersion: batch/v1
+                kind: Job
+                metadata: { name: pvc-and-dns, namespace: "{{ ns }}" }
+                spec:
+                  backoffLimit: 2
+                  template:
+                    spec:
+                      restartPolicy: Never
+                      containers:
+                        - name: check
+                          image: busybox:1.37
+                          command:
+                            - sh
+                            - -c
+                            - >-
+                              nslookup kubernetes.default.svc.cluster.local &&
+                              echo smoke-ok > /data/probe &&
+                              grep -q smoke-ok /data/probe &&
+                              echo "dns+pvc ok"
+                          volumeMounts: [{ name: data, mountPath: /data }]
+                      volumes:
+                        - name: data
+                          persistentVolumeClaim: { claimName: data }
+
+        - name: Wait for web pods on both workers
+          kubernetes.core.k8s_info:
+            kind: Deployment
+            name: web
+            namespace: "{{ ns }}"
+            wait: true
+            wait_condition: { type: Available, status: "True" }
+            wait_timeout: 300
+
+        - name: Check web pods are spread over 2 nodes
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ ns }}"
+            label_selectors: [app=web]
+          register: web_pods
+          failed_when: web_pods.resources | map(attribute='spec.nodeName') | unique | list | length != 2
+
+        - name: Wait for DNS + PVC job to complete
+          kubernetes.core.k8s_info:
+            kind: Job
+            name: pvc-and-dns
+            namespace: "{{ ns }}"
+            wait: true
+            wait_condition: { type: Complete, status: "True" }
+            wait_timeout: 300
+
+        - name: Check PVC is Bound
+          kubernetes.core.k8s_info:
+            kind: PersistentVolumeClaim
+            name: data
+            namespace: "{{ ns }}"
+          register: pvc
+          failed_when: pvc.resources[0].status.phase != 'Bound'
+
+        - name: Get Gateway address
+          kubernetes.core.k8s_info:
+            api_version: gateway.networking.k8s.io/v1
+            kind: Gateway
+            name: public
+            namespace: gateway
+          register: gw
+
+        - name: Fetch nginx through MetalLB + Envoy Gateway from the control machine
+          ansible.builtin.uri:
+            url: "http://{{ gw.resources[0].status.addresses[0].value }}/"
+            return_content: true
+          delegate_to: localhost
+          become: false
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          register: web_http
+          until: web_http.status == 200 and 'nginx' in web_http.content
+          retries: 12
+          delay: 5
+
+        - name: Report
+          ansible.builtin.debug:
+            msg:
+              - "web pods on: {{ web_pods.resources | map(attribute='spec.nodeName') | list }}"
+              - "PVC: {{ pvc.resources[0].status.phase }} ({{ pvc.resources[0].spec.storageClassName }})"
+              - "Gateway http://{{ gw.resources[0].status.addresses[0].value }}/ -> HTTP {{ web_http.status }}"
+              - "Smoke test passed"
+
+      always:
+        - name: Delete smoke-test namespace
+          kubernetes.core.k8s:
+            kind: Namespace
+            name: "{{ ns }}"
+            state: absent
+            wait: true
+            wait_timeout: 180
+          when: not (keep_smoke_test | default(false) | bool)

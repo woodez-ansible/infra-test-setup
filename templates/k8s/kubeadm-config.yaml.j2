@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: {{ ansible_host }}
+  bindPort: {{ k8s_api_port }}
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: unix:///run/containerd/containerd.sock
+  # kubelet --node-ip is set for every node in /etc/default/kubelet (20-kube-packages.yml)
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version }}
+clusterName: homelab
+controlPlaneEndpoint: {{ k8s_api_name }}:{{ k8s_api_port }}
+networking:
+  podSubnet: {{ k8s_pod_cidr }}
+  serviceSubnet: {{ k8s_service_cidr }}
+  dnsDomain: cluster.local
+apiServer:
+  certSANs:
+    - {{ k8s_api_name }}
+    - {{ inventory_hostname }}
+    - {{ ansible_host }}
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd

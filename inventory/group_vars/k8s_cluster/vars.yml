@@ -1,0 +1,40 @@
+---
+# ---------- Versions (pinned 2026-10-08) ----------
+k8s_version: "1.37.1"
+k8s_minor: "{{ k8s_version.split('.')[:2] | join('.') }}"
+k8s_pause_version: "3.10.2"          # kubeadm v1.37.1 default
+calico_version: v3.33.0              # tested with k8s 1.35-1.37
+metallb_chart_version: "0.16.1"
+envoy_gateway_version: v1.9.2        # officially tested with k8s up to 1.36
+local_path_version: v0.0.37
+helm_version: v4.3.0
+helm_sha256: 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
+
+# ---------- Networking ----------
+k8s_api_name: k8s-api
+k8s_api_port: 6443
+k8s_api_ip: "{{ hostvars[groups['k8s_control_plane'][0]].ansible_host }}"
+k8s_lan_cidr: 192.168.2.0/24
+k8s_pod_cidr: 10.244.0.0/16
+k8s_service_cidr: 10.96.0.0/12
+metallb_pool: 192.168.2.240-192.168.2.250
+
+# ---------- Time (same as db01) ----------
+system_timezone: America/Toronto
+ntp_pools:
+  - 0.ca.pool.ntp.org
+  - 1.ca.pool.ntp.org
+  - 2.ca.pool.ntp.org
+  - 3.ca.pool.ntp.org
+
+# ---------- Paths ----------
+k8s_admin_user: kwood
+k8s_local_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/homelab.conf"
+local_path_dir: /opt/local-path-provisioner
+
+# ---------- etcd backups ----------
+etcd_backup_dir: /var/backups/etcd
+etcd_backup_keep: 7
+
+# Repo template dir (independent of which playbook imports a phase)
+repo_templates: "{{ inventory_dir }}/../templates"
