@@ -1,0 +1,40 @@
+# __APP__, __IMAGE__ and __HOST__ are filled in by the deploy workflow.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __APP__
+  labels: { app: __APP__ }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: __APP__ }
+  template:
+    metadata:
+      labels: { app: __APP__ }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: __IMAGE__
+          ports:
+            - name: http
+              containerPort: 8080          # your app must listen here (or change it + service.yaml)
+          env:
+            - name: PORT
+              value: "8080"
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }

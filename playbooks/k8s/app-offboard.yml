@@ -1,0 +1,47 @@
+---
+# Remove an app: deletes its namespace (everything in it) and its repo's deploy secrets.
+#   ansible-playbook playbooks/k8s/app-offboard.yml -e app=myapp -e repo=woodez/myapp -e confirm=yes
+- name: Offboard app
+  hosts: k8s_control_plane
+  become: true
+
+  vars:
+    reserved_namespaces: [default, kube-system, kube-public, kube-node-lease, calico-system,
+                          calico-apiserver, tigera-operator, metallb-system, envoy-gateway-system,
+                          gateway, local-path-storage, arc-systems, arc-runners]
+
+  pre_tasks:
+    - name: Validate inputs and require confirmation
+      ansible.builtin.assert:
+        that:
+          - app is defined and app not in reserved_namespaces
+          - repo is defined
+          - confirm | default('') == 'yes'
+        fail_msg: "Deletes namespace '{{ app | default('?') }}' and all its data. Re-run with -e app=<name> -e repo=<owner>/<repo> -e confirm=yes"
+        quiet: true
+      run_once: true
+
+  tasks:
+    - name: Delete namespace {{ app }}
+      kubernetes.core.k8s:
+        kubeconfig: /etc/kubernetes/admin.conf
+        kind: Namespace
+        name: "{{ app }}"
+        state: absent
+        wait: true
+        wait_timeout: 300
+
+    - name: Remove repo secrets and variables
+      ansible.builtin.command: gh {{ item }} -R {{ repo }}
+      loop:
+        - secret delete KUBE_TOKEN
+        - secret delete KUBE_CA
+        - variable delete KUBE_NAMESPACE
+        - variable delete APP_NAME
+        - variable delete APP_HOSTNAME
+      register: gh_rm
+      changed_when: gh_rm.rc == 0
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }

@@ -370,3 +370,115 @@ ssh kwood@<node> 'sudo crictl ps -a; sudo journalctl -u kubelet -n 50 --no-pager
 | Backups | master: `/var/backups/etcd/` |
 | Helm releases | `metallb` (metallb-system), `eg` (envoy-gateway-system) |
 | Namespaces | `calico-system`, `tigera-operator`, `metallb-system`, `envoy-gateway-system`, `gateway`, `local-path-storage`, `kube-system` |
+
+## 8. CI/CD with GitHub Actions (admin guide)
+
+Developers deploy with GitHub Actions; their guide is [dev-howto-k8s.md](dev-howto-k8s.md).
+
+- **Builds** run on GitHub-hosted runners and push to GHCR.
+- **Deploy jobs** run on `runs-on: k8s-deploy`, a self-hosted runner scale set managed
+  by Actions Runner Controller (ARC) in the cluster.
+  - Runner pods start per job, at most 2 at a time, on kube01 or kube02.
+  - They have no cluster access of their own.
+  - Each app's deploy job uses a token limited to that app's namespace.
+
+| Piece | Where |
+|---|---|
+| ARC controller | `arc-systems` (Helm release `arc`, chart 0.15.0) |
+| Runner scale set `k8s-deploy` | `arc-runners` (Helm release `k8s-deploy`); org `woodez`, runner group `k8s-deploy` |
+| GitHub App credentials | Secret `arc-runners/arc-github-app`, from the vault |
+| GHCR pull token | Secret `ghcr-pull` in each app namespace, from the vault |
+| Route permissions | ClusterRole `gateway-routes-edit` (aggregated into `edit`) |
+| Playbooks | `playbooks/k8s/65-cicd.yml`, `app-onboard.yml`, `app-offboard.yml` |
+| Developer templates | `examples/github-actions/` (workflow + manifests), `examples/demo-app/` |
+
+### One-time setup
+
+1. **Create the GitHub App.** Go to github.com → org **woodez** → Settings → Developer
+   settings → GitHub Apps → **New GitHub App**.
+   - **Name:** e.g. `woodez-k8s-arc`. **Homepage URL:** anything, e.g. the org URL.
+   - **Webhook:** untick **Active**.
+   - **Permissions:** Organization → **Self-hosted runners: Read and write**.
+     Repository → Metadata: Read-only (default).
+   - **Where can this app be installed:** Only on this account.
+   - Create it, then note the **App ID** on its settings page.
+   - **Private keys → Generate a private key**, which downloads a `.pem` file.
+   - **Install App** → woodez → **All repositories**. The number at the end of the
+     installation page URL (`.../installations/<id>`) is the **Installation ID**.
+2. **Create the image-pull token.** github.com → your profile → Settings → Developer
+   settings → Personal access tokens → **Tokens (classic)** → Generate.
+   - Scope: **`read:packages` only**. Set an expiry and note when it needs renewing.
+   - GHCR needs a classic token; fine-grained tokens don't work with it.
+3. **Put the values in the vault:**
+   ```bash
+   cp inventory/group_vars/k8s_cluster/vault.yml.example inventory/group_vars/k8s_cluster/vault.yml
+   # edit: App ID, Installation ID, paste the .pem contents (indented 2 spaces), the PAT
+   ansible-vault encrypt inventory/group_vars/k8s_cluster/vault.yml   # same password as .vault_pass
+   rm ~/Downloads/<app-name>.*.private-key.pem                        # once it's in the vault
+   ```
+4. **Give `gh` org-admin scope.** Runner groups need it: run
+   `gh auth refresh -h github.com -s admin:org`.
+5. **Org setting:** Settings → Actions → General → Fork pull request workflows →
+   **Require approval for all outside collaborators**.
+6. **Install ARC:** `ansible-playbook playbooks/k8s/65-cicd.yml`. The run ends by
+   showing the listener pod `Ready`, which proves the App credentials work.
+
+### Onboard / offboard an app
+
+```bash
+ansible-playbook playbooks/k8s/app-onboard.yml  -e app=myapp -e repo=woodez/myapp
+ansible-playbook playbooks/k8s/app-onboard.yml  -e app=myapp -e repo=woodez/myapp -e rotate_token=true
+ansible-playbook playbooks/k8s/app-offboard.yml -e app=myapp -e repo=woodez/myapp -e confirm=yes
+```
+
+Onboarding:
+
+- creates namespace `myapp`, with a quota, default limits, `baseline` pod security and
+  the GHCR pull secret
+- creates the `deployer` ServiceAccount with `edit` on that namespace only
+- sets the repo's `KUBE_TOKEN` and `KUBE_CA` secrets and its `KUBE_NAMESPACE`,
+  `APP_NAME` and `APP_HOSTNAME` variables
+- finishes by checking that the token **can** deploy in `myapp` and **can't** read
+  `kube-system` or list nodes
+
+It's safe to re-run. It always re-uploads the repo secrets, so it reports `changed`.
+Offboarding deletes the namespace and everything in it.
+
+### Verified end to end (2026-10-10)
+
+A private demo repo, [`woodez/k8s-deploy-demo`](https://github.com/woodez/k8s-deploy-demo),
+was onboarded and pushed. The run took about 75 seconds:
+
+1. The build on `ubuntu-latest` pushed `ghcr.io/woodez/k8s-deploy-demo:<sha>`. GHCR
+   refuses anonymous pulls of it, confirming it's private.
+2. A runner pod `k8s-deploy-runner-*` started in `arc-runners`, ran the deploy job, and
+   was deleted.
+3. 2 pods, one on kube01 and one on kube02, pulled the private image with `ghcr-pull`.
+4. The HTTPRoute was `Accepted`, and
+   `curl -H 'Host: k8s-deploy-demo.apexkube.xyz' http://192.168.2.240/` answers from both
+   pods.
+
+Keep the repo as the reference app for developers.
+
+### CI/CD troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `65-cicd.yml` waits on the listener; `kubectl -n arc-runners get autoscalingrunnerset` shows `Pending` | read the controller log: `kubectl -n arc-systems logs deploy/arc-gha-rs-controller \| grep ERROR \| tail -3` |
+| log: `failed to parse RSA private key from PEM` | the key in the vault is mangled; check the `-----BEGIN/END RSA PRIVATE KEY-----` lines have 5 dashes each and every key line is indented 2 spaces. Fix with `ansible-vault edit`, re-run `65-cicd.yml`, then `kubectl -n arc-systems rollout restart deploy/arc-gha-rs-controller`, because the controller backs off and doesn't retry promptly after a fix |
+| log: `401`/`404` fetching an access token | wrong App ID or Installation ID, or the App isn't installed on woodez; check with `gh api orgs/woodez/installations --jq '.installations[] \| [.app_slug,.id]'` |
+| `gh: This API operation needs the "admin:org" scope` | `gh auth refresh -h github.com -s admin:org` |
+| deploy job stays `queued`, no pod in `arc-runners` | the listener isn't running (see the first row), the repo isn't allowed in runner group `k8s-deploy`, or `runs-on` isn't exactly `k8s-deploy` |
+| pods `ImagePullBackOff` with `401` | GHCR PAT expired or lacks `read:packages`; update the vault and re-run `app-onboard.yml` |
+
+### Notes
+
+- **Private repos on the free plan.** GitHub environments aren't available for them,
+  so the deploy credentials are repository secrets. GitHub never gives them to fork
+  PRs, and the workflow only deploys from `main`, but anyone with write access to the
+  repo could read them. That's acceptable here because a token only affects its own
+  namespace.
+- **Rotating the GitHub App key.** Generate a new key, update the vault, re-run
+  `65-cicd.yml`, then delete the old key in the App settings.
+- **Renewing the GHCR PAT.** Update the vault, then re-run `app-onboard.yml` for each
+  app. Each run rewrites that app's `ghcr-pull` secret.

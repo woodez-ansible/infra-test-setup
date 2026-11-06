@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# gha-runner-scale-set values: org-level runners for {{ github_org }}, used by deploy jobs only.
+githubConfigUrl: https://github.com/{{ github_org }}
+githubConfigSecret: arc-github-app        # created by 65-cicd.yml (GitHub App credentials)
+runnerScaleSetName: {{ arc_runner_set_name }}
+runnerGroup: {{ arc_runner_group }}
+minRunners: {{ arc_min_runners }}
+maxRunners: {{ arc_max_runners }}
+
+controllerServiceAccount:
+  namespace: arc-systems
+  name: arc-gha-rs-controller
+
+template:
+  spec:
+    # Runner pods get no Kubernetes API access of their own; each deploy job brings
+    # its app's namespace-scoped token (KUBE_TOKEN) instead.
+    automountServiceAccountToken: false
+    containers:
+      - name: runner
+        image: {{ arc_runner_image }}
+        command: ["/home/runner/run.sh"]
+        resources:
+          requests: { cpu: 250m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 512Mi }

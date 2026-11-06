@@ -1,0 +1,14 @@
+---
+# Copy to vault.yml, fill in, then: ansible-vault encrypt inventory/group_vars/k8s_cluster/vault.yml
+# (use the same vault password as the dbservers vault, i.e. the one in .vault_pass)
+
+# GitHub App used by Actions Runner Controller (see k8s-howto-3node.md, "CI/CD: one-time setup")
+vault_arc_github_app_id: "CHANGE_ME"                 # App ID (or Client ID) from the App's settings page
+vault_arc_github_app_installation_id: "CHANGE_ME"    # number at the end of the installation URL
+vault_arc_github_app_private_key: |
+  -----BEGIN RSA PRIVATE KEY-----
+  CHANGE_ME
+  -----END RSA PRIVATE KEY-----
+
+# Classic PAT with ONLY read:packages, used by the cluster to pull private GHCR images
+vault_ghcr_pull_token: "CHANGE_ME"
