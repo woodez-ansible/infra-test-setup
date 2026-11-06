@@ -1,0 +1,149 @@
+---
+# CI/CD: GitHub Actions Runner Controller (ARC) with an org-level runner scale set,
+# plus the cluster-wide RBAC that app onboarding relies on.
+- name: "Phase 6b: CI/CD runners (Actions Runner Controller)"
+  hosts: k8s_control_plane
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: /etc/kubernetes/admin.conf
+    group/kubernetes.core.helm:
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  pre_tasks:
+    - name: Ensure CI/CD secrets are set in the vault
+      ansible.builtin.assert:
+        that:
+          - vault_arc_github_app_id is defined
+          - vault_arc_github_app_installation_id is defined
+          - vault_arc_github_app_private_key is defined
+          - "'CHANGE_ME' not in (vault_arc_github_app_id ~ vault_arc_github_app_installation_id ~ vault_arc_github_app_private_key)"
+        fail_msg: >-
+          Fill in inventory/group_vars/k8s_cluster/vault.yml (see vault.yml.example) and
+          encrypt it with ansible-vault before running this phase.
+        quiet: true
+
+  tasks:
+    # ---------- GitHub org runner group (from the control machine, via gh) ----------
+    - name: Look up runner group {{ arc_runner_group }}
+      ansible.builtin.command: >-
+        gh api orgs/{{ github_org }}/actions/runner-groups
+        --jq '.runner_groups[] | select(.name=="{{ arc_runner_group }}") | [.id, .allows_public_repositories, .visibility] | @tsv'
+      register: runner_group
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    - name: Create runner group {{ arc_runner_group }} (all repos, public included)
+      ansible.builtin.command: >-
+        gh api -X POST orgs/{{ github_org }}/actions/runner-groups
+        -f name={{ arc_runner_group }} -f visibility=all -F allows_public_repositories=true
+      when: runner_group.stdout == ''
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    - name: Allow public repos on existing runner group {{ arc_runner_group }}
+      ansible.builtin.command: >-
+        gh api -X PATCH orgs/{{ github_org }}/actions/runner-groups/{{ runner_group.stdout.split('\t')[0] }}
+        -F allows_public_repositories=true
+      when: runner_group.stdout != '' and runner_group.stdout.split('\t')[1] != 'true'
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    # ---------- RBAC used by onboarded apps ----------
+    - name: Let the built-in edit/admin roles manage Gateway API routes
+      kubernetes.core.k8s:
+        apply: true
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: gateway-routes-edit
+            labels:
+              rbac.authorization.k8s.io/aggregate-to-edit: "true"
+              rbac.authorization.k8s.io/aggregate-to-admin: "true"
+          rules:
+            - apiGroups: [gateway.networking.k8s.io]
+              resources: [httproutes, grpcroutes]
+              verbs: [get, list, watch, create, update, patch, delete]
+
+    # ---------- ARC ----------
+    - name: Install ARC controller {{ arc_chart_version }}
+      kubernetes.core.helm:
+        name: arc
+        chart_ref: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+        chart_version: "{{ arc_chart_version }}"
+        release_namespace: arc-systems
+        create_namespace: true
+        wait: true
+        wait_timeout: 5m
+
+    - name: Create arc-runners namespace
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: arc-runners
+
+    - name: Store GitHub App credentials for ARC
+      kubernetes.core.k8s:
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: arc-github-app
+            namespace: arc-runners
+          type: Opaque
+          stringData:
+            github_app_id: "{{ arc_github_app_id | string }}"
+            github_app_installation_id: "{{ arc_github_app_installation_id | string }}"
+            github_app_private_key: "{{ arc_github_app_private_key }}"
+      no_log: true
+
+    - name: Install runner scale set {{ arc_runner_set_name }}
+      kubernetes.core.helm:
+        name: "{{ arc_runner_set_name }}"
+        chart_ref: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+        chart_version: "{{ arc_chart_version }}"
+        release_namespace: arc-runners
+        values: "{{ lookup('template', repo_templates ~ '/k8s/arc-runner-values.yaml.j2') | from_yaml }}"
+        wait: true
+        wait_timeout: 5m
+
+    # ---------- Checks ----------
+    - name: Wait for the runner scale set listener (proves GitHub App auth works)
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: arc-systems
+        label_selectors:
+          - actions.github.com/scale-set-name={{ arc_runner_set_name }}
+      register: arc_listener
+      # The listener pod only appears once the controller has authenticated to GitHub,
+      # so poll for it (k8s_info's wait returns immediately when nothing matches yet).
+      until: >-
+        arc_listener.resources | length > 0 and
+        (arc_listener.resources[0].status.containerStatuses | default([]) | selectattr('ready') | list | length) > 0
+      retries: 30
+      delay: 10
+
+    - name: Confirm GitHub sees the scale set
+      ansible.builtin.command: >-
+        gh api orgs/{{ github_org }}/actions/runner-groups
+        --jq '.runner_groups[] | select(.name=="{{ arc_runner_group }}") | .id'
+      register: rg_id
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Listener: {{ arc_listener.resources[0].metadata.name }} on {{ arc_listener.resources[0].spec.nodeName }}"
+          - "Workflows can now use: runs-on: {{ arc_runner_set_name }}  (runner group '{{ arc_runner_group }}', id {{ rg_id.stdout }})"
+          - "Next: onboard an app with playbooks/k8s/app-onboard.yml -e app=<name> -e repo={{ github_org }}/<repo>"

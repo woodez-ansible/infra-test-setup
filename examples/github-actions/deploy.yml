@@ -1,0 +1,104 @@
+# .github/workflows/deploy.yml
+# Build the image on a GitHub-hosted runner, push it to GHCR, then deploy it from a
+# self-hosted runner inside the homelab Kubernetes cluster.
+#
+# Needs (set by the admin's app-onboard playbook, nothing to add by hand):
+#   secrets:   KUBE_TOKEN, KUBE_CA
+#   variables: KUBE_NAMESPACE, APP_NAME, APP_HOSTNAME
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # manual "Run workflow" button; also used to redeploy
+
+permissions:
+  contents: read
+  packages: write           # push to ghcr.io with the built-in GITHUB_TOKEN
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false # never cancel a deploy half-way
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Image reference (ghcr.io/<owner>/<repo>:<short sha>, lowercase)
+        id: image
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "ref=ghcr.io/${repo}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64          # cluster nodes are x86_64
+          tags: ${{ steps.image.outputs.ref }}
+          build-args: APP_VERSION=${{ github.sha }}   # ignored if the Dockerfile has no ARG APP_VERSION
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'   # never deploy from other branches or PRs
+    runs-on: k8s-deploy                   # in-cluster runner (Actions Runner Controller)
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      APP: ${{ vars.APP_NAME }}
+      HOST: ${{ vars.APP_HOSTNAME }}
+      NAMESPACE: ${{ vars.KUBE_NAMESPACE }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.37.1
+
+      - name: Configure kubectl (namespace-scoped deploy token)
+        env:
+          KUBE_TOKEN: ${{ secrets.KUBE_TOKEN }}
+          KUBE_CA: ${{ secrets.KUBE_CA }}
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          echo "$KUBE_CA" | base64 -d > "$RUNNER_TEMP/ca.crt"
+          kubectl config set-cluster homelab --server=https://kubernetes.default.svc \
+            --certificate-authority="$RUNNER_TEMP/ca.crt"
+          kubectl config set-credentials deployer --token="$KUBE_TOKEN"
+          kubectl config set-context deploy --cluster=homelab --user=deployer --namespace="$NAMESPACE"
+          kubectl config use-context deploy
+
+      - name: Render manifests
+        run: |
+          mkdir -p "$RUNNER_TEMP/k8s"
+          for f in k8s/*.yaml; do
+            sed -e "s|__IMAGE__|$IMAGE|g" -e "s|__APP__|$APP|g" -e "s|__HOST__|$HOST|g" \
+              "$f" > "$RUNNER_TEMP/k8s/$(basename "$f")"
+          done
+          grep -h "image:" "$RUNNER_TEMP"/k8s/*.yaml
+
+      - name: Deploy
+        run: |
+          kubectl apply -f "$RUNNER_TEMP/k8s/"
+          kubectl rollout status deployment/"$APP" --timeout=180s
+
+      - name: Summary
+        if: always()
+        run: |
+          kubectl get deploy,pods,svc,httproute -o wide || true
+          echo "### Deployed \`$IMAGE\` to \`$NAMESPACE\` → http://$HOST/" >> "$GITHUB_STEP_SUMMARY"

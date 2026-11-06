@@ -145,3 +145,13 @@ ansible-playbook playbooks/k8s.yml                 # or everything, in order (id
 - **Backups:** `/var/backups/etcd/` on master holds daily etcd snapshots and PKI
   archives, newest 7 of each. Run one now with `sudo systemctl start etcd-backup`.
 - **Tear down:** `ansible-playbook playbooks/k8s/99-reset.yml -e confirm_reset=yes`.
+
+## Deploying apps with GitHub Actions
+
+Developers: [dev-howto-k8s.md](dev-howto-k8s.md). Admins (runner setup, onboarding apps):
+section 8 of [k8s-howto-3node.md](k8s-howto-3node.md).
+
+```bash
+ansible-playbook playbooks/k8s/65-cicd.yml                                         # runners (once)
+ansible-playbook playbooks/k8s/app-onboard.yml -e app=myapp -e repo=woodez/myapp   # per app
+```

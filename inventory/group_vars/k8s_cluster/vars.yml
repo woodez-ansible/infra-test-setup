@@ -38,3 +38,30 @@ etcd_backup_keep: 7
 
 # Repo template dir (independent of which playbook imports a phase)
 repo_templates: "{{ inventory_dir }}/../templates"
+
+# ---------- CI/CD: GitHub Actions runners (ARC) + app onboarding ----------
+github_org: woodez
+arc_chart_version: "0.15.0"
+arc_runner_image: ghcr.io/actions/actions-runner:2.338.0
+arc_runner_set_name: k8s-deploy          # workflows use: runs-on: k8s-deploy
+arc_runner_group: k8s-deploy             # org runner group; "Default" on plans without custom groups
+arc_min_runners: 0
+arc_max_runners: 2
+ghcr_pull_user: kevinwood75              # owner of the read:packages PAT in the vault
+app_domain: apexkube.xyz                 # apps get http://<app>.apexkube.xyz via Gateway "public"
+
+# Per-app namespace limits (workers have ~2.4 GiB free each)
+app_quota:
+  requests_cpu: "1"
+  requests_memory: 1Gi
+  limits_cpu: "2"
+  limits_memory: 2Gi
+  pods: "10"
+app_default_limits:   { cpu: 500m, memory: 256Mi }
+app_default_requests: { cpu: 50m,  memory: 64Mi }
+
+# Secrets (inventory/group_vars/k8s_cluster/vault.yml, encrypted)
+arc_github_app_id: "{{ vault_arc_github_app_id }}"
+arc_github_app_installation_id: "{{ vault_arc_github_app_installation_id }}"
+arc_github_app_private_key: "{{ vault_arc_github_app_private_key }}"
+ghcr_pull_token: "{{ vault_ghcr_pull_token }}"

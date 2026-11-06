@@ -1,0 +1,142 @@
+---
+# Onboard an app so its GitHub repo can deploy to the cluster.
+#   ansible-playbook playbooks/k8s/app-onboard.yml -e app=myapp -e repo=woodez/myapp
+#   (re-run any time; add -e rotate_token=true to issue a new deploy token)
+- name: Onboard app for GitHub Actions deploys
+  hosts: k8s_control_plane
+  become: true
+  module_defaults:
+    group/kubernetes.core.k8s:
+      kubeconfig: /etc/kubernetes/admin.conf
+
+  vars:
+    reserved_namespaces: [default, kube-system, kube-public, kube-node-lease, calico-system,
+                          calico-apiserver, tigera-operator, metallb-system, envoy-gateway-system,
+                          gateway, local-path-storage, arc-systems, arc-runners]
+    app_hostname: "{{ app }}.{{ app_domain }}"
+    gh_local: &gh_local
+      delegate_to: localhost
+      become: false
+
+  pre_tasks:
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - app is defined and app is match('^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$')
+          - app not in reserved_namespaces
+          - repo is defined and repo is match('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+          - ghcr_pull_token is defined and 'CHANGE_ME' not in ghcr_pull_token
+        fail_msg: >-
+          Usage: -e app=<dns-name, lowercase, max 32 chars> -e repo=<owner>/<repo>.
+          app must not be a system namespace, and vault_ghcr_pull_token must be set.
+        quiet: true
+      run_once: true
+
+    - name: Check the GitHub repo exists and is reachable with gh
+      ansible.builtin.command: gh repo view {{ repo }} --json nameWithOwner --jq .nameWithOwner
+      changed_when: false
+      <<: *gh_local
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+  tasks:
+    # ---------- Namespace, limits, deploy identity ----------
+    - name: Rotate deploy token
+      kubernetes.core.k8s:
+        kind: Secret
+        name: deployer-token
+        namespace: "{{ app }}"
+        state: absent
+        wait: true
+      when: rotate_token | default(false) | bool
+
+    - name: Create namespace, quota, limits, deployer ServiceAccount and RoleBinding
+      kubernetes.core.k8s:
+        apply: true
+        definition: "{{ lookup('template', repo_templates ~ '/k8s/app-namespace.yaml.j2') | from_yaml_all | list }}"
+
+    - name: Create GHCR pull secret
+      kubernetes.core.k8s:
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata: { name: ghcr-pull, namespace: "{{ app }}" }
+          type: kubernetes.io/dockerconfigjson
+          stringData:
+            .dockerconfigjson: >-
+              {{ {'auths': {'ghcr.io': {'username': ghcr_pull_user, 'password': ghcr_pull_token,
+                  'auth': (ghcr_pull_user ~ ':' ~ ghcr_pull_token) | b64encode}}} | to_json }}
+      no_log: true
+
+    - name: Use the pull secret for every pod in the namespace
+      kubernetes.core.k8s:
+        kind: ServiceAccount
+        name: default
+        namespace: "{{ app }}"
+        state: patched
+        definition:
+          imagePullSecrets:
+            - name: ghcr-pull
+
+    - name: Wait for the deploy token to be issued
+      kubernetes.core.k8s_info:
+        kind: Secret
+        name: deployer-token
+        namespace: "{{ app }}"
+      register: token_secret
+      until: token_secret.resources | length > 0 and (token_secret.resources[0].data.token | default('')) != ''
+      retries: 10
+      delay: 2
+      no_log: true
+
+    # ---------- GitHub repo secrets/variables (from the control machine, via gh) ----------
+    - name: Set repository secrets KUBE_TOKEN and KUBE_CA
+      ansible.builtin.command:
+        cmd: gh secret set {{ item.name }} -R {{ repo }}
+        stdin: "{{ item.value }}"
+      loop:
+        - { name: KUBE_TOKEN, value: "{{ token_secret.resources[0].data.token | b64decode }}" }
+        - { name: KUBE_CA,    value: "{{ token_secret.resources[0].data['ca.crt'] }}" }   # base64 PEM
+      loop_control: { label: "{{ item.name }}" }
+      changed_when: true
+      no_log: true
+      <<: *gh_local
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    - name: Set repository variables
+      ansible.builtin.command: gh variable set {{ item.name }} -R {{ repo }} --body {{ item.value }}
+      loop:
+        - { name: KUBE_NAMESPACE, value: "{{ app }}" }
+        - { name: APP_NAME,       value: "{{ app }}" }
+        - { name: APP_HOSTNAME,   value: "{{ app_hostname }}" }
+      loop_control: { label: "{{ item.name }}={{ item.value }}" }
+      changed_when: true
+      <<: *gh_local
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    # ---------- Check: the token can do exactly what it should ----------
+    - name: Verify deploy token permissions
+      ansible.builtin.shell: |
+        set -e
+        tok=$(kubectl --kubeconfig /etc/kubernetes/admin.conf -n {{ app }} get secret deployer-token -o jsonpath='{.data.token}' | base64 -d)
+        k() { kubectl --kubeconfig /dev/null --server https://{{ ansible_host }}:{{ k8s_api_port }} \
+              --certificate-authority /etc/kubernetes/pki/ca.crt --token "$tok" "$@"; }
+        echo "own-ns deployments: $(k auth can-i create deployments -n {{ app }})"
+        echo "own-ns httproutes: $(k auth can-i create httproutes.gateway.networking.k8s.io -n {{ app }})"
+        echo "kube-system pods: $(k auth can-i get pods -n kube-system || true)"
+        echo "cluster nodes: $(k auth can-i list nodes || true)"
+      args: { executable: /bin/bash }
+      register: can_i
+      changed_when: false
+      failed_when: >-
+        'own-ns deployments: yes' not in can_i.stdout or
+        'own-ns httproutes: yes' not in can_i.stdout or
+        'kube-system pods: no' not in can_i.stdout or
+        'cluster nodes: no' not in can_i.stdout
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Namespace {{ app }} ready; {{ repo }} has secrets KUBE_TOKEN, KUBE_CA and variables KUBE_NAMESPACE, APP_NAME, APP_HOSTNAME"
+          - "{{ can_i.stdout_lines }}"
+          - "App URL once deployed: http://{{ app_hostname }}/  (Gateway 192.168.2.240)"

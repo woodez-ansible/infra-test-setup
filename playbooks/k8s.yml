@@ -7,5 +7,6 @@
 - import_playbook: k8s/40-calico.yml
 - import_playbook: k8s/50-workers.yml
 - import_playbook: k8s/60-addons.yml
+- import_playbook: k8s/65-cicd.yml
 - import_playbook: k8s/70-etcd-backup.yml
 - import_playbook: k8s/90-smoke-test.yml
