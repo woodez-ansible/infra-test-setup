@@ -1,9 +1,17 @@
 # Plan: build Ubuntu VMs on libvirt (compute02) with Terraform + Ansible
 
-Status: **draft, awaiting approval.** Nothing has been changed on compute02. This plan
-is based on read-only checks of compute02 made on 2026-11-06.
+Status: **approved 2026-11-06, with the GitHub Actions change approved the same day.
+Not built yet.** Nothing has been changed on compute02. This plan is based on read-only
+checks of compute02 made on 2026-11-06.
 
-The goal is one command that builds a VM from a short settings file you control:
+The goal is that **a VM's settings file in this repo is the VM**:
+
+1. Add or edit `vms/web01.yml` in a pull request.
+2. Merge it, and GitHub Actions plans the change on a runner on compute02.
+3. You approve, and it builds or updates the VM.
+4. Deleting the file, after approval, destroys the VM.
+
+The same code also runs by hand from the Mac as a fallback:
 
 ```bash
 ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
@@ -19,8 +27,10 @@ and get a DHCP address, then connects over SSH and applies a baseline.
 |---|---|
 | Hypervisor | **compute02**, 192.168.2.6, SSH as `kwood`, sudo to root |
 | IaC tool | **Terraform v1.17.1** with provider **`dmacvicar/libvirt` v0.9.9**, both pinned |
-| Where Terraform runs | **On compute02**, as `kwood`, against `qemu:///system` (kwood is in the `libvirt` group, so no sudo is needed at run time) |
-| Orchestration | **Ansible on the Mac** drives everything: syncs the Terraform code, renders the VM's settings, runs Terraform, waits for the VM, then configures it |
+| Trigger | **GitOps:** one spec file per VM in `vms/`. Merging to `master` builds, updates or destroys VMs through GitHub Actions, and **every run waits for your approval** |
+| CI runner | **Self-hosted GitHub runner on compute02**, registered to this repo only, running as a dedicated `gha-runner` user with **passwordless sudo** (your choice; see section 9) |
+| Where Terraform runs | **On compute02**, against `qemu:///system`: as `gha-runner` from CI, or as `kwood` for the manual fallback. Both are in the `libvirt` group and a shared `vm-builder` group that owns `/opt/vm-builder` |
+| Orchestration | **Ansible** syncs the Terraform code, renders the VM's settings, runs Terraform, waits for the VM, then configures it. It runs on the runner in CI, or on the Mac for the manual fallback |
 | OS image | **Ubuntu 26.04 LTS** cloud image by default; settable per VM (e.g. 24.04) |
 | Network | **DHCP on bridge `br0`**: the VM is an ordinary LAN host, like db01 |
 | Finding the IP | **qemu-guest-agent**, installed by cloud-init; libvirt can't see the router's DHCP leases on a bridged network |
@@ -42,8 +52,34 @@ and get a DHCP address, then connects over SSH and applies a baseline.
 
 ## 3. How a build works
 
+### From GitHub Actions (the normal path)
+
 ```
-Mac: ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
+PR adds/edits/deletes vms/web01.yml
+  └─► vm-validate.yml   GitHub-hosted runner, no access to your network
+        yamllint · spec schema check · terraform fmt -check · terraform validate
+merge to master
+  └─► vm-gitops.yml     self-hosted runner on compute02 (labels: self-hosted, compute02, vm-builder)
+        detect: added/edited specs → build/update · deleted specs → destroy
+        job "plan"   (one per VM): terraform plan saved to a file, shown in the job summary
+        job "apply"  ⏸ waits for YOUR approval in environment vm-build (or vm-destroy)
+                     then applies exactly the saved plan, followed by the steps below
+                     → summary: name, IP, MAC, vCPU/RAM/disk
+```
+
+- **One VM at a time:** each VM has its own concurrency group (`vm-<name>`), so two
+  merges can never run Terraform on the same VM at once.
+- **Approval:** the run shows Terraform's real plan before you approve, so you're
+  approving the exact change, not just a YAML diff. If the VM changes between plan and
+  apply, the saved plan no longer applies and the job fails rather than doing something
+  else.
+- **Manual re-run:** `workflow_dispatch` with a `vm_name` input re-applies an existing
+  spec, e.g. after someone changed the VM by hand. It goes through the same approval.
+
+### The build steps (shared by CI and the manual fallback)
+
+```
+ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
  1. validate settings; preflight on compute02:
       name unused, RAM fits, pool has space, base image present
  2. copy terraform/ to compute02:/opt/vm-builder (only if changed)
@@ -63,7 +99,8 @@ Mac: ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
 
 ## 4. VM settings: what you can specify
 
-A VM is one small YAML file in `vms/`. Anything you leave out takes the default shown.
+A VM is one small YAML file in `vms/`, reviewed in a PR like any other change.
+Anything you leave out takes the default shown.
 
 ```yaml
 # vms/web01.yml
@@ -95,6 +132,8 @@ vm_ubuntu_release: "26.04"   # "26.04" | "24.04"
 | `vm_firmware` | `bios` | or `uefi` (OVMF is installed) |
 | `vm_cpu_mode` | `host-passthrough` | best performance; use `host-model` if you might move VMs between hosts |
 | `vm_description` | `""` | stored as the libvirt domain title |
+| `vm_allow_restart` | `false` | set `true` in the spec to let a vCPU/RAM change restart the VM |
+| `vm_allow_replace` | `false` | set `true` to let a release or MAC change rebuild the VM; **its disk is lost** |
 
 Settings are validated before anything is built: types, ranges, name format, and a
 check that the name isn't already a libvirt domain or a Terraform workspace.
@@ -109,11 +148,19 @@ terraform/
     main.tf  variables.tf  outputs.tf  versions.tf
     templates/user-data.yaml.tftpl  meta-data.yaml.tftpl  network-config.yaml.tftpl
 vms/
-  example.yml              # documented example settings
+  example.yml              # documented example settings (ignored by the workflows)
+  <name>.yml               # one file per VM: the VM exists while its file does
+.github/workflows/
+  vm-validate.yml          # PRs: static checks on GitHub-hosted runners only
+  vm-gitops.yml            # master + manual: plan → approval → apply on compute02
+ci/
+  ansible.cfg              # CI config: inventory/ci.yml, no vault
+  validate_vm_spec.py      # spec schema/range checks (used by both workflows and the playbook)
+inventory/ci.yml           # compute02 as localhost (connection: local) for the runner
 inventory/hosts.yml        # + hypervisors: compute02
 inventory/group_vars/hypervisors/vars.yml   # pool, bridge, image URLs, versions, defaults
 playbooks/
-  hypervisor-prep.yml      # one-time: install Terraform, create /opt/vm-builder, base images
+  hypervisor-prep.yml      # one-time: Terraform, /opt/vm-builder, base images, GitHub runner
   vm-build.yml             # build or update a VM from vms/<name>.yml
   vm-destroy.yml           # -e vm_name=web01 -e confirm=yes
   vm-list.yml              # VMs, state, IPs, resources; host capacity left
@@ -132,7 +179,9 @@ would delete the base image that every other VM's disk depends on. So:
 
 ### Terraform details
 
-- **Code location:** `/opt/vm-builder` on compute02, owned by kwood. State lives in
+- **Code location:** `/opt/vm-builder` on compute02, owned by group `vm-builder` (setgid,
+  group-writable), so `gha-runner` and `kwood` share the same code and state. Terraform's
+  state lock stops them running at the same time. State lives in
   `/opt/vm-builder/vm/terraform.tfstate.d/<name>/` (one directory per workspace).
   `hypervisor-prep.yml` adds a nightly copy of all state to `/var/backups/vm-builder/`.
 - **Provider:** `uri = "qemu:///system"`. Terraform runs locally on compute02, so
@@ -158,18 +207,41 @@ would delete the base image that every other VM's disk depends on. So:
 
 | Playbook | Runs on | What it does |
 |---|---|---|
-| `hypervisor-prep.yml` | compute02 (sudo) | adds the HashiCorp apt repo and installs `terraform=1.17.1-*` (held); creates `/opt/vm-builder`; runs `terraform -chdir=images apply`; sets up the state backup; checks `virt-host-validate` |
+| `hypervisor-prep.yml` | compute02 (sudo), run once from the Mac | adds the HashiCorp apt repo and installs `terraform=1.17.1-*` (held); creates group `vm-builder` and `/opt/vm-builder`, with a pinned Ansible venv for CI; runs `terraform -chdir=images apply`; sets up the state backup; checks `virt-host-validate`; **installs the GitHub runner** (see section 6a) |
 | `vm-build.yml` | compute02, then the new VM | steps 1–8 of section 3; re-running it with changed settings updates the VM in place where libvirt allows (see below) |
 | `vm-destroy.yml` | compute02 | needs `-e confirm=yes`; `terraform destroy` in that VM's workspace, removes the workspace and its tfvars, reports the space freed |
 | `vm-list.yml` | compute02 | table of VMs with state, IP (from the agent), vCPU, RAM and disk, plus free host RAM and pool space |
 
 **What a re-run can change:**
 
-- **Applied with a reboot of the VM:** vCPU and RAM. The playbook shuts the VM down and
-  starts it again, and asks for `-e allow_restart=yes` first.
+- **Applied with a reboot of the VM:** vCPU and RAM. The VM is shut down and started
+  again, which needs `vm_allow_restart: true` in the spec (or `-e allow_restart=yes` by
+  hand).
 - **Grown in place:** disk size. Shrinking is refused.
 - **Replaces the VM:** a different Ubuntu release or a new MAC address. Terraform's plan
-  would show this, and the playbook stops unless you pass `-e allow_replace=yes`.
+  shows this, and the run stops unless the spec sets `vm_allow_replace: true` (or
+  `-e allow_replace=yes` by hand).
+
+## 6a. The GitHub runner on compute02
+
+| Item | Design |
+|---|---|
+| Software | `actions/runner` **v2.338.0** in `/opt/actions-runner`, as a systemd service; checksum verified on download |
+| User | `gha-runner`: system user with groups `libvirt` and `vm-builder`, **passwordless sudo** via `/etc/sudoers.d/gha-runner`, and its own ed25519 SSH key, which cloud-init adds to every new VM alongside your Mac key |
+| Registration | **repo-level** to `woodez-ansible/infra-test-setup`; labels `self-hosted, linux, x64, compute02, vm-builder`. `hypervisor-prep.yml` fetches a short-lived registration token with your `gh` login; no long-lived token is stored |
+| Workspace | `/opt/actions-runner/_work`; every job starts from a clean checkout |
+| Ansible in CI | `ANSIBLE_CONFIG=ci/ansible.cfg` with inventory `inventory/ci.yml` (compute02 with `ansible_connection: local`) and **no vault**, so no vault password is stored on the runner or in GitHub |
+| Removal | `hypervisor-prep.yml -e remove_runner=yes` unregisters the runner and removes the service |
+
+### GitHub settings (approved 2026-11-06)
+
+| Setting | Value | Why |
+|---|---|---|
+| Fork PR workflows | require approval for **all outside contributors** | was only first-time contributors |
+| Allowed actions | **GitHub-owned only**; workflows pin `actions/checkout` to a full commit SHA | the workflows need nothing else |
+| Ruleset on `master` | changes only through a PR; no force-push or deletion; `vm-validate` required once that workflow exists (step 5) | a required check that doesn't exist yet would block every merge |
+| Environments | `vm-build` and `vm-destroy`: required reviewer **kevinwood75**; deployments from `master` only | your approval on every run |
+| Workflow permissions | `contents: read` in every workflow; nothing pushes commits, so nothing can re-trigger itself | least privilege; no workflow loops |
 
 ## 7. How the plan is verified (when it's built)
 
@@ -196,6 +268,16 @@ would delete the base image that every other VM's disk depends on. So:
    - a VM bigger than the free RAM is refused
    - a bad name such as `Web_01` is refused
    - `vm-destroy.yml` without `confirm=yes` is refused
+8. **GitHub Actions** (step 5):
+   - a PR with a bad spec (e.g. `vm_memory_mib: 99999`) fails `vm-validate`, and
+     nothing runs on compute02
+   - merging `vms/test01.yml` runs `plan`, then **waits for approval**; approving builds
+     it, and the summary shows its IP
+   - editing the spec, with `vm_allow_restart: true`, updates the VM after approval
+   - deleting the spec waits in `vm-destroy`; approving destroys only `test01`
+   - rejecting an approval leaves the VM untouched
+   - a PR from a fork runs only `vm-validate` on GitHub's runners; the runner's job
+     history shows nothing ran on compute02
 
 ## 8. Delivery
 
@@ -206,11 +288,31 @@ Per your git rules, the work goes on a branch with a PR rather than straight ont
 2. `terraform/vm` + `vm-build.yml` + `vm-list.yml`, then verify (steps 2–5)
 3. `vm-destroy.yml` + negative checks, then verify (steps 6–7)
 4. Turn this plan into a how-to section in this file, with a reference for every setting
+5. GitHub runner + `vm-validate.yml` + `vm-gitops.yml` + `ci/`, the environments, and
+   the `vm-validate` required check, then verify (step 8)
+
+The three repo settings that don't depend on the workflows (fork PR approval, allowed
+actions, the base `master` ruleset) are applied now, ahead of the build.
 
 ## 9. Risks, assumptions and open items
 
-- **sudo is passwordless** (fixed and confirmed 2026-11-06). Only `hypervisor-prep.yml`
-  uses it. Building and destroying VMs run as kwood through the `libvirt` group.
+- **The runner has passwordless sudo on the host that runs db01.** You chose this, so
+  the workflow can also run host preparation. Any workflow change merged to `master`
+  then runs as root on compute02. The safeguards:
+  - every change to `master` goes through a reviewed PR
+  - every run needs your approval
+  - PR code never runs on the runner
+
+  Once things are stable, consider narrowing `gha-runner`'s sudo rule to what VM
+  builds need.
+- **Public repo.** The runner never runs pull-request code; only `vm-validate` runs on
+  PRs, on GitHub's own runners. Keep it that way: never add `pull_request` or
+  `pull_request_target` triggers to a job with `runs-on: [self-hosted, …]`.
+- **The approved plan is computed on the runner.** You approve what the runner shows,
+  so the runner itself has to be trusted. That's another reason it only ever runs
+  reviewed code from `master`.
+- **sudo for kwood is passwordless** (fixed and confirmed 2026-11-06). The manual
+  fallback only uses it for `hypervisor-prep.yml`.
 - **DHCP addresses can change.** A VM's IP may differ after a rebuild or after its
   lease expires. Because each VM gets a stable MAC, a **DHCP reservation on the
   router** pins it. For anything long-lived, such as a server you'll put in the
