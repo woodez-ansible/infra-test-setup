@@ -1,0 +1,35 @@
+---
+# Defaults for every VM. Loaded with vars_files by both plays of vm-build.yml (the
+# hypervisor play and the new-VM play), so the VM itself sees them too. A spec file
+# (vms/<name>.yml, passed with -e @vms/<name>.yml) overrides any of these.
+# See build-vm.md §4 for what each one does.
+vm_vcpus: 2
+vm_memory_mib: 2048
+vm_disk_gib: 20
+vm_extra_disks: []
+vm_ubuntu_release: "26.04"
+vm_bridge: "{{ vm_bridge_default }}"
+vm_mac: ""                       # empty = derived from vm_name (stable per name)
+vm_user: kwood
+# Public keys from the machine running Ansible (the Mac, or the CI runner in step 5)
+vm_ssh_authorized_keys: "{{ lookup('ansible.builtin.pipe', 'cat ' ~ lookup('env', 'HOME') ~ '/.ssh/id_*.pub 2>/dev/null || true') | split('\n') | select | list }}"
+vm_passwordless_sudo: true
+vm_password_login: false
+vm_timezone: America/Toronto
+vm_packages: []
+vm_apt_upgrade: true             # full upgrade on first build only
+vm_autostart: true
+vm_firmware: bios                # bios | uefi
+vm_cpu_mode: host-passthrough    # host-passthrough | host-model
+vm_description: ""
+vm_allow_restart: false          # allow a vCPU/RAM change to restart the VM
+vm_allow_replace: false          # allow a change that rebuilds the VM (its disk is lost)
+
+# Host-side limits used by the preflight checks
+vm_host_memory_reserve_mib: 1024
+vm_bridge_default: br0
+ntp_pools:
+  - 0.ca.pool.ntp.org
+  - 1.ca.pool.ntp.org
+  - 2.ca.pool.ntp.org
+  - 3.ca.pool.ntp.org

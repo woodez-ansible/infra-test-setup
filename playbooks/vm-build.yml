@@ -1,0 +1,428 @@
+---
+# Build or update one VM from a spec file.
+#   ansible-playbook playbooks/vm-build.yml -e @vms/<name>.yml
+# Re-running with a changed spec updates the VM. A vCPU/RAM change needs
+# vm_allow_restart: true; a change that rebuilds the VM needs vm_allow_replace: true.
+
+# ---------------------------------------------------------------------------
+- name: Plan and apply the VM on the hypervisor
+  hosts: hypervisors
+  gather_facts: false
+  become: false
+  vars_files:
+    - vars/vm_defaults.yml
+
+  vars:
+    tf_root: "{{ vm_builder_dir }}"
+    tf_vm_dir: "{{ vm_builder_dir }}/vm"
+    tf_env:
+      TF_PLUGIN_CACHE_DIR: "{{ vm_builder_dir }}/.plugin-cache"
+      TF_IN_AUTOMATION: "1"
+    repo_root: "{{ inventory_dir }}/.."
+    derived_mac: >-
+      {%- set h = vm_name | hash('md5') -%}
+      52:54:00:{{ h[0:2] }}:{{ h[2:4] }}:{{ h[4:6] }}
+
+  pre_tasks:
+    - name: Validate the VM spec
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+          - vm_name is match('^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$')
+          - vm_vcpus | int >= 1 and vm_vcpus | int <= 16
+          - vm_memory_mib | int >= 512 and vm_memory_mib | int <= 16384
+          - vm_disk_gib | int >= 5 and vm_disk_gib | int <= 500
+          - vm_ubuntu_release | string in ubuntu_images
+          - vm_firmware in ['bios', 'uefi']
+          - vm_cpu_mode in ['host-passthrough', 'host-model']
+          - vm_mac == '' or vm_mac is match('^52:54:00(:[0-9a-f]{2}){3}$')
+          - vm_ssh_authorized_keys | length > 0
+          - vm_extra_disks | map(attribute='size_gib') | select('integer') | list | length == vm_extra_disks | length
+          - vm_passwordless_sudo or vm_password_login
+        fail_msg: >-
+          Invalid spec. Check: vm_name (lowercase, digits, '-', max 32), vm_vcpus 1-16,
+          vm_memory_mib 512-16384, vm_disk_gib 5-500, vm_ubuntu_release in
+          {{ ubuntu_images.keys() | list }}, vm_firmware bios|uefi, vm_cpu_mode
+          host-passthrough|host-model, vm_mac 52:54:00:xx:xx:xx, at least one SSH key,
+          extra disks as [{size_gib: N}], and sudo must be usable (passwordless sudo or
+          password login).
+        quiet: true
+
+    - name: Resolve settings
+      ansible.builtin.set_fact:
+        vm:
+          name: "{{ vm_name }}"
+          mac: "{{ vm_mac if vm_mac else derived_mac | trim }}"
+          release: "{{ vm_ubuntu_release | string }}"
+
+  tasks:
+    # ---------- Preflight ----------
+    - name: Read base volumes (terraform/images output)
+      ansible.builtin.command: terraform -chdir={{ tf_root }}/images output -json base_volumes
+      environment: "{{ tf_env }}"
+      register: base_out
+      changed_when: false
+
+    - name: Pick the base volume for Ubuntu {{ vm.release }}
+      ansible.builtin.set_fact:
+        base_volume_path: "{{ (base_out.stdout | from_json)[vm.release].path }}"
+
+    - name: Gather host state
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "domain=$(virsh -c {{ libvirt_uri }} dominfo {{ vm.name }} >/dev/null 2>&1 && echo yes || echo no)"
+        if [ -d "{{ tf_vm_dir }}/terraform.tfstate.d/{{ vm.name }}" ]; then echo "managed=yes"; else echo "managed=no"; fi
+        echo "mem_avail_mib=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
+        echo "host_cpus=$(nproc)"
+        echo "pool_avail_gib=$(virsh -c {{ libvirt_uri }} pool-info {{ libvirt_pool }} --bytes | awk '/Available/{print int($2/1024/1024/1024)}')"
+        # No domain yet is normal for a new VM, so don't let virsh's error end the script
+        cur=$(virsh -c {{ libvirt_uri }} dominfo {{ vm.name }} 2>/dev/null | awk '/Max memory/{print int($3/1024)}' || true)
+        echo "current_mem_mib=${cur:-0}"
+      args: { executable: /bin/bash }
+      register: host_state
+      changed_when: false
+
+    - name: Parse host state
+      ansible.builtin.set_fact:
+        host: "{{ dict(host_state.stdout_lines | map('split', '=', 1)) }}"
+
+    - name: Refuse to touch a VM this tool didn't create
+      ansible.builtin.assert:
+        that: not (host.domain == 'yes' and host.managed == 'no')
+        fail_msg: >-
+          A libvirt domain named '{{ vm.name }}' already exists but isn't managed by the
+          VM builder. Pick another vm_name.
+        quiet: true
+
+    - name: Check there's enough free RAM
+      ansible.builtin.assert:
+        that: >-
+          (vm_memory_mib | int) - (host.current_mem_mib | int)
+          <= (host.mem_avail_mib | int) - (vm_host_memory_reserve_mib | int)
+        fail_msg: >-
+          Not enough RAM: '{{ vm.name }}' needs {{ (vm_memory_mib | int) - (host.current_mem_mib | int) }}
+          MiB more, but only {{ host.mem_avail_mib }} MiB is available on the host
+          (keeping {{ vm_host_memory_reserve_mib }} MiB in reserve).
+        quiet: true
+
+    - name: Check there's enough pool space
+      ansible.builtin.assert:
+        that: (vm_disk_gib | int) + (vm_extra_disks | map(attribute='size_gib') | sum) <= (host.pool_avail_gib | int)
+        fail_msg: "Not enough space in pool {{ libvirt_pool }}: {{ host.pool_avail_gib }} GiB free."
+        quiet: true
+
+    - name: Warn about vCPU overcommit
+      ansible.builtin.debug:
+        msg: "vm_vcpus={{ vm_vcpus }} is more than the host's {{ host.host_cpus }} CPUs; it will run, but slowly under load."
+      when: vm_vcpus | int > host.host_cpus | int
+
+    # ---------- Terraform code + variables ----------
+    - name: Create Terraform directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        group: "{{ vm_builder_group }}"
+        mode: "2775"
+      loop:
+        - "{{ tf_vm_dir }}"
+        - "{{ tf_vm_dir }}/templates"
+        - "{{ tf_root }}/vms"
+        - "{{ tf_root }}/plans"
+
+    - name: Copy terraform/vm code (*.tf and lock file)
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ tf_vm_dir }}/"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+      with_fileglob:
+        - "{{ repo_root }}/terraform/vm/*.tf"
+        - "{{ repo_root }}/terraform/vm/.terraform.lock.hcl"
+
+    - name: Copy terraform/vm templates
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ tf_vm_dir }}/templates/"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+      with_fileglob:
+        - "{{ repo_root }}/terraform/vm/templates/*.tftpl"
+
+    - name: Write {{ vm.name }}.tfvars.json
+      ansible.builtin.copy:
+        dest: "{{ tf_root }}/vms/{{ vm.name }}.tfvars.json"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+        content: "{{ tfvars | to_nice_json }}\n"
+      vars:
+        tfvars:
+          libvirt_uri: "{{ libvirt_uri }}"
+          pool: "{{ libvirt_pool }}"
+          name: "{{ vm.name }}"
+          description: "{{ vm_description }}"
+          vcpus: "{{ vm_vcpus | int }}"
+          memory_mib: "{{ vm_memory_mib | int }}"
+          disk_gib: "{{ vm_disk_gib | int }}"
+          extra_disks: "{{ vm_extra_disks }}"
+          base_volume_path: "{{ base_volume_path }}"
+          bridge: "{{ vm_bridge }}"
+          mac: "{{ vm.mac }}"
+          firmware: "{{ vm_firmware }}"
+          cpu_mode: "{{ vm_cpu_mode }}"
+          autostart: "{{ vm_autostart | bool }}"
+          user: "{{ vm_user }}"
+          ssh_authorized_keys: "{{ vm_ssh_authorized_keys }}"
+          passwordless_sudo: "{{ vm_passwordless_sudo | bool }}"
+          password_login: "{{ vm_password_login | bool }}"
+          timezone: "{{ vm_timezone }}"
+
+    # ---------- Terraform: init, workspace, plan ----------
+    - name: Terraform init + select workspace {{ vm.name }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        terraform init -input=false -no-color >/dev/null
+        terraform workspace select -or-create -no-color {{ vm.name }}
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      register: tf_ws
+      changed_when: "'Created and switched' in tf_ws.stdout"
+
+    - name: Keep Terraform's working files group-writable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: g+rwX
+        group: "{{ vm_builder_group }}"
+        recurse: "{{ item is not search('lock.hcl$') }}"
+      loop:
+        - "{{ tf_vm_dir }}/.terraform"
+        - "{{ tf_vm_dir }}/.terraform.lock.hcl"
+        - "{{ tf_vm_dir }}/terraform.tfstate.d"
+
+    - name: Terraform plan
+      ansible.builtin.shell: |
+        set -uo pipefail
+        umask 0002
+        export TF_WORKSPACE={{ vm.name }}
+        terraform plan -input=false -no-color -detailed-exitcode \
+          -var-file={{ tf_root }}/vms/{{ vm.name }}.tfvars.json \
+          -out={{ tf_root }}/plans/{{ vm.name }}.tfplan
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      register: tf_plan
+      changed_when: false
+      failed_when: tf_plan.rc not in [0, 2]
+
+    - name: Read the plan as JSON
+      ansible.builtin.command: terraform show -json {{ tf_root }}/plans/{{ vm.name }}.tfplan
+      args: { chdir: "{{ tf_vm_dir }}" }
+      environment: "{{ tf_env | combine({'TF_WORKSPACE': vm.name}) }}"
+      register: tf_plan_json
+      changed_when: false
+      when: tf_plan.rc == 2
+
+    - name: Collect the planned changes
+      ansible.builtin.set_fact:
+        changes: >-
+          {{ ((tf_plan_json.stdout | default('{}')) | from_json).resource_changes | default([])
+             | rejectattr('change.actions', 'eq', ['no-op']) | list }}
+
+    - name: Classify the planned changes
+      ansible.builtin.set_fact:
+        # A brand-new VM (no domain in state yet)
+        creating: "{{ dom.change.actions | default([]) == ['create'] }}"
+        # Domain or root disk deleted and recreated: the VM is rebuilt, its disk lost
+        replacing: >-
+          {{ changes | selectattr('address', 'in', ['libvirt_domain.vm', 'libvirt_volume.root'])
+             | selectattr('change.actions', 'contains', 'delete') | list | length > 0 }}
+        # In-place domain update that changes vCPU or RAM: needs a restart to take effect
+        resizing: >-
+          {{ dom.change.actions | default([]) == ['update']
+             and ((dom.change.before.memory | default(0)) != (dom.change.after.memory | default(0))
+                  or (dom.change.before.vcpu | default(0)) != (dom.change.after.vcpu | default(0))) }}
+      vars:
+        dom: "{{ changes | selectattr('address', 'eq', 'libvirt_domain.vm') | first | default({}) }}"
+
+    - name: Show planned changes
+      ansible.builtin.debug:
+        msg: "{{ changes | map(attribute='address') | zip(changes | map(attribute='change.actions') | map('join', '/')) | map('join', ': ') | list }}"
+      when: tf_plan.rc == 2
+
+    - name: Refuse to rebuild an existing VM unless allowed
+      ansible.builtin.assert:
+        that: not replacing or creating or vm_allow_replace | bool
+        fail_msg: >-
+          This change would REBUILD '{{ vm.name }}' and its root disk would be lost.
+          Set vm_allow_replace: true in the spec if that's intended.
+        quiet: true
+
+    - name: Refuse to restart a running VM unless allowed
+      ansible.builtin.assert:
+        that: not (resizing | bool) or creating or vm_allow_restart | bool
+        fail_msg: >-
+          Changing vCPU/RAM of '{{ vm.name }}' needs a restart.
+          Set vm_allow_restart: true in the spec to allow it.
+        quiet: true
+
+    # ---------- Apply ----------
+    - name: Terraform apply
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        export TF_WORKSPACE={{ vm.name }}
+        terraform apply -input=false -no-color {{ tf_root }}/plans/{{ vm.name }}.tfplan
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      when: tf_plan.rc == 2
+      changed_when: true
+
+    - name: Keep the provider lock file in the repo
+      ansible.builtin.fetch:
+        src: "{{ tf_vm_dir }}/.terraform.lock.hcl"
+        dest: "{{ repo_root }}/terraform/vm/.terraform.lock.hcl"
+        flat: true
+
+    - name: Restart the VM so new vCPU/RAM take effect
+      ansible.builtin.shell: |
+        set -euo pipefail
+        v="virsh -c {{ libvirt_uri }}"
+        $v shutdown {{ vm.name }}
+        for i in $(seq 1 60); do
+          [ "$($v domstate {{ vm.name }})" = "shut off" ] && break
+          sleep 2
+        done
+        [ "$($v domstate {{ vm.name }})" = "shut off" ] || $v destroy {{ vm.name }}
+        $v start {{ vm.name }}
+      args: { executable: /bin/bash }
+      when: tf_plan.rc == 2 and (resizing | bool) and not creating
+      changed_when: true
+
+    # ---------- Find the VM ----------
+    - name: Wait for the guest agent to report an IPv4 address
+      ansible.builtin.shell: |
+        virsh -c {{ libvirt_uri }} domifaddr {{ vm.name }} --source agent 2>/dev/null \
+          | awk '$3=="ipv4" && $4 !~ /^127\./ {split($4,a,"/"); print a[1]; exit}'
+      register: vm_ip
+      until: vm_ip.stdout | length > 0
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Forget any old SSH host key for {{ vm_ip.stdout }} (rebuilt VMs reuse DHCP IPs)
+      ansible.builtin.known_hosts:
+        name: "{{ vm_ip.stdout }}"
+        state: absent
+      delegate_to: localhost
+      when: creating or replacing
+
+    - name: Add the VM to this run's inventory
+      ansible.builtin.add_host:
+        name: "{{ vm.name }}"
+        groups: [new_vm]
+        ansible_host: "{{ vm_ip.stdout }}"
+        ansible_user: "{{ vm_user }}"
+        ansible_ssh_common_args: -o StrictHostKeyChecking=accept-new
+        vm_first_build: "{{ creating or replacing }}"
+        vm_mac_resolved: "{{ vm.mac }}"
+      changed_when: false
+
+# ---------------------------------------------------------------------------
+- name: Baseline the VM
+  hosts: new_vm
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars/vm_defaults.yml
+
+  handlers:
+    - name: Restart chrony
+      ansible.builtin.service:
+        name: chrony
+        state: restarted
+
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      register: ci_status
+      changed_when: false
+      failed_when: ci_status.rc not in [0, 2]   # 2 = done with recoverable warnings
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    # "First build" = the baseline has never completed on this VM. A marker file is more
+    # reliable than "Terraform created it this run", which a failed first run would lose.
+    - name: Create the VM builder marker directory
+      ansible.builtin.file:
+        path: /var/lib/vm-builder
+        state: directory
+        mode: "0755"
+
+    - name: Check whether the baseline has completed before
+      ansible.builtin.stat:
+        path: /var/lib/vm-builder/baseline-done
+      register: baseline_marker
+
+    - name: Full upgrade (until the first baseline completes)
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+      when: not baseline_marker.stat.exists and vm_apt_upgrade | bool
+
+    - name: Install packages
+      ansible.builtin.apt:
+        name: "{{ ['chrony', 'qemu-guest-agent'] + vm_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Set timezone
+      community.general.timezone:
+        name: "{{ vm_timezone }}"
+
+    - name: Configure chrony
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/chrony.conf.j2"   # playbook_dir: inventory_dir is empty for add_host hosts
+        dest: /etc/chrony/chrony.conf
+        mode: "0644"
+      notify: Restart chrony
+
+    - name: Ensure chrony and the guest agent are running
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [chrony, qemu-guest-agent]
+
+    - name: Apply chrony config
+      ansible.builtin.meta: flush_handlers
+
+    - name: Record that the baseline completed
+      ansible.builtin.copy:
+        dest: /var/lib/vm-builder/baseline-done
+        content: "baseline completed by vm-build.yml\n"
+        mode: "0644"
+      when: not baseline_marker.stat.exists
+
+    - name: Collect the VM's state
+      ansible.builtin.shell: |
+        echo "release=$(. /etc/os-release; echo $VERSION_ID)"
+        echo "root=$(df -BG --output=size / | tail -1 | tr -d ' ')"
+        echo "tz=$(timedatectl show -p Timezone --value)"
+        echo "synced=$(chronyc -n waitsync 30 0.1 0 2 >/dev/null && echo yes || echo no)"
+        echo "sudo=$(sudo -n -u {{ vm_user }} sudo -n true 2>/dev/null && echo nopasswd || echo password)"
+      register: vm_state
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ inventory_hostname }} ready at {{ ansible_host }} (ssh {{ vm_user }}@{{ ansible_host }})"
+          - "MAC {{ vm_mac_resolved }} (use it for a DHCP reservation on the router)"
+          - "{{ vm_vcpus }} vCPU, {{ vm_memory_mib }} MiB RAM, {{ vm_disk_gib }} GiB disk"
+          - "{{ vm_state.stdout_lines }}"
+          - "Inventory line: {{ inventory_hostname }}: { ansible_host: {{ ansible_host }} }"

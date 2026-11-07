@@ -1,0 +1,11 @@
+version: 2
+ethernets:
+  lan:
+    # Match by MAC: interface names differ between machine types
+    match:
+      macaddress: "${mac}"
+    set-name: eth0
+    dhcp4: true
+    # Identify to the DHCP server by MAC, not systemd-networkd's default DUID, so the
+    # router keeps the same lease across reboots and MAC-based reservations work.
+    dhcp-identifier: mac
