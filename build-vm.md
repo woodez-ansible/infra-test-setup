@@ -221,6 +221,14 @@ would delete the base image that every other VM's disk depends on. So:
   profile when the disk is file-type. With volume-type disks, QEMU was silently denied
   the base image ("Permission denied", nothing logged). Base volumes are also created
   `0644`; that wasn't the cause, but it's right for shared, read-only images.
+- **The provider's cloud-init ISOs live in `/opt/vm-builder/cloudinit-tmp/`**
+  (`TMPDIR`), not `/tmp`. The provider records the ISO's path in state, and if the
+  file disappears it plans to recreate the cloud-init disk, replace its volume and
+  update the VM. `/tmp` is wiped on every reboot, so that would hit every VM; this was
+  verified by hiding `test02`'s ISO. Its subdirectory also belonged to whichever user
+  ran first, which broke the first CI build. The directory is created group-writable
+  (`2775`, `vm-builder`). VMs built before this change (`test02`, `test03`) still point
+  at `/tmp`.
 - **cloud-init content changes are ignored after creation** (`ignore_changes`).
   cloud-init only reads its config on first boot, so rebuilding the config disk of an
   existing VM achieves nothing.
