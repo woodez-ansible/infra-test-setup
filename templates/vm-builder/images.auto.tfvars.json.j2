@@ -1,0 +1,8 @@
+{#- {{ ansible_managed }} — JSON has no comments, so this note is a Jinja comment -#}
+{%- set images = {} -%}
+{%- for release, img in ubuntu_images.items() -%}
+{%-   set _ = images.update({release: {
+        'build': img.build,
+        'path': tf_cache_dir ~ '/ubuntu-' ~ release ~ '-' ~ img.build ~ '.img'}}) -%}
+{%- endfor -%}
+{{ {'libvirt_uri': libvirt_uri, 'pool': libvirt_pool, 'images': images} | to_nice_json }}
