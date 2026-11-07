@@ -3,6 +3,9 @@
 #   ansible-playbook playbooks/vm-destroy.yml -e vm_name=<name> -e confirm=yes
 # Only VMs that have a VM-builder Terraform workspace can be destroyed; anything else
 # on the host (db01, hand-made VMs) is refused. Base images are never touched.
+#
+# vm_phase (default all): GitHub Actions runs "plan" (lists what would be destroyed,
+# then stops), waits for approval, then runs "apply" (destroys).
 - name: Destroy a VM
   hosts: hypervisors
   gather_facts: false
@@ -11,6 +14,7 @@
     - vars/vm_defaults.yml
 
   vars:
+    vm_phase: all                     # all | plan | apply
     tf_root: "{{ vm_builder_dir }}"
     tf_vm_dir: "{{ vm_builder_dir }}/vm"
     tf_env:
@@ -25,6 +29,7 @@
           - vm_name is defined
           - vm_name is match('^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$')
           - confirm | default('') == 'yes'
+          - vm_phase in ['all', 'plan', 'apply']
         fail_msg: >-
           This permanently deletes the VM and its disks.
           Re-run with -e vm_name=<name> -e confirm=yes
@@ -64,6 +69,23 @@
       environment: "{{ tf_env }}"
       register: tf_resources
       changed_when: false
+
+    - name: Save what would be destroyed (shown in the GitHub job summary)
+      ansible.builtin.copy:
+        dest: "{{ tf_root }}/plans/{{ vm_name }}-destroy.txt"
+        mode: "0664"
+        content: |
+          DESTROY {{ vm_name }}{{ (' (IP ' ~ target.ip ~ ')') if target.ip else '' }}, about {{ target.mem_mib | default('?') }} MiB RAM.
+          These resources and their data will be permanently deleted:
+          {% for r in tf_resources.stdout_lines %}
+            - {{ r }}
+          {% endfor %}
+          Base images and other VMs are not touched.
+      when: vm_phase == 'plan'
+
+    - name: Stop here in the plan phase (approval happens in GitHub)
+      ansible.builtin.meta: end_play
+      when: vm_phase == 'plan'
 
     - name: Terraform destroy
       ansible.builtin.shell: |

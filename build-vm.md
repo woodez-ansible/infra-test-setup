@@ -58,23 +58,41 @@ and get a DHCP address, then connects over SSH and applies a baseline.
 PR adds/edits/deletes vms/web01.yml
   └─► vm-validate.yml   GitHub-hosted runner, no access to your network
         yamllint · spec schema check · terraform fmt -check · terraform validate
-merge to master
+merge to master (or "Run workflow")
   └─► vm-gitops.yml     self-hosted runner on compute02 (labels: self-hosted, compute02, vm-builder)
-        detect: added/edited specs → build/update · deleted specs → destroy
-        job "plan"   (one per VM): terraform plan saved to a file, shown in the job summary
-        job "apply"  ⏸ waits for YOUR approval in environment vm-build (or vm-destroy)
-                     then applies exactly the saved plan, followed by the steps below
-                     → summary: name, IP, MAC, vCPU/RAM/disk
+        job "plan"           reconcile EVERYTHING, no approval needed (it changes nothing):
+                               - vm-build.yml -e vm_phase=plan for every vms/<name>.yml
+                               - vm-destroy.yml -e vm_phase=plan for every builder-managed VM
+                                 that has no spec any more
+                             readable plans go to the job summary; only VMs with real
+                             changes are passed on
+        job "apply-destroy"  ⏸ approval in environment vm-destroy → destroy (one VM at a time)
+        job "apply-build"    ⏸ approval in environment vm-build → apply exactly the saved
+                             plan, then the steps below (one VM at a time; runs after
+                             destroys, which free RAM, and not at all if a destroy fails or
+                             is rejected) → summary: name, IP, MAC
 ```
 
-- **One VM at a time:** each VM has its own concurrency group (`vm-<name>`), so two
-  merges can never run Terraform on the same VM at once.
+**Why reconcile everything, not just what the push changed?** GitHub keeps only one
+pending run per concurrency group and cancels older pending ones. With "what this push
+changed", a cancelled run would lose that push's VM changes for good. Reconciling every
+spec on every run makes a cancelled run harmless, because the next run catches up.
+Approvals are still only asked for VMs with actual changes. **Consequence:** any
+builder-managed VM without a spec in `master` (e.g. one built by hand from an uncommitted
+spec) is proposed for destruction. You'd see it in the plan and can reject it.
+
+- **One run at a time:** the whole workflow is one concurrency group, and apply jobs run
+  one VM at a time, so two runs can never touch Terraform at once.
 - **Approval:** the run shows Terraform's real plan before you approve, so you're
   approving the exact change, not just a YAML diff. If the VM changes between plan and
   apply, the saved plan no longer applies and the job fails rather than doing something
   else.
-- **Manual re-run:** `workflow_dispatch` with a `vm_name` input re-applies an existing
-  spec, e.g. after someone changed the VM by hand. It goes through the same approval.
+- **Manual run:** "Run workflow" (`workflow_dispatch`) reconciles everything, e.g.
+  after someone changed a VM by hand. It goes through the same approvals.
+- **Plan/apply split in the playbooks:** `vm_phase=plan` saves the Terraform plan plus a
+  readable copy in `/opt/vm-builder/plans/` and stops; `vm_phase=apply` applies exactly
+  that saved plan. Terraform rejects it if the VM changed in between. `vm_phase=all`
+  (the default) is the manual one-shot.
 
 ### The build steps (shared by CI and the manual fallback)
 
@@ -251,11 +269,12 @@ would delete the base image that every other VM's disk depends on. So:
 
 | Item | Design |
 |---|---|
-| Software | `actions/runner` **v2.338.0** in `/opt/actions-runner`, as a systemd service; checksum verified on download |
-| User | `gha-runner`: system user with groups `libvirt` and `vm-builder`, **passwordless sudo** via `/etc/sudoers.d/gha-runner`, and its own ed25519 SSH key, which cloud-init adds to every new VM alongside your Mac key |
+| Software | `actions/runner` **v2.338.2** (2.338.0 when planned) in `/opt/actions-runner`, as a systemd service; SHA-256 checked against the value published in the release notes |
+| User | `gha-runner`: system user with groups `libvirt`, `kvm` and `vm-builder`, **passwordless sudo** via `/etc/sudoers.d/gha-runner`, and its own ed25519 SSH key. Every VM gets **`vm_admin_authorized_keys`** (your Mac's public key, in `group_vars/hypervisors/vars.yml`) plus the keys of whoever runs the build, so CI-built VMs stay reachable from the Mac |
 | Registration | **repo-level** to `woodez-ansible/infra-test-setup`; labels `self-hosted, linux, x64, compute02, vm-builder`. `hypervisor-prep.yml` fetches a short-lived registration token with your `gh` login; no long-lived token is stored |
 | Workspace | `/opt/actions-runner/_work`; every job starts from a clean checkout |
-| Ansible in CI | `ANSIBLE_CONFIG=ci/ansible.cfg` with inventory `inventory/ci.yml` (compute02 with `ansible_connection: local`) and **no vault**, so no vault password is stored on the runner or in GitHub |
+| Ansible in CI | `/opt/vm-builder/venv` (ansible-core 2.21.4) with `community.general` in `/opt/vm-builder/collections`; `ANSIBLE_CONFIG=ci/ansible.cfg` with inventory `inventory/ci.yml` (compute02 with `ansible_connection: local`) and **no vault**, so no vault password is stored on the runner or in GitHub |
+| PR checks | `vm-validate` on `ubuntu-latest`: `ci/validate_vm_spec.py` (ranges, choices, **file name = `vm_name`**, **unknown keys rejected**, so a typo can't silently fall back to a default), all YAML parses, `terraform fmt`/`validate` with a SHA-256-checked Terraform 1.17.1, and an Ansible syntax check |
 | Removal | `hypervisor-prep.yml -e remove_runner=yes` unregisters the runner and removes the service |
 
 ### GitHub settings (approved 2026-11-06)

@@ -29,3 +29,21 @@ vm_builder_backup_keep_days: 14
 
 # Same time setup as the other hosts
 system_timezone: America/Toronto
+
+# ---------- Admin access to every VM ----------
+# Public keys only (safe in a public repo). Added to every VM alongside the keys of
+# whoever runs the build (the Mac, or the GitHub runner), so CI-built VMs stay reachable.
+vm_admin_authorized_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM4sTGyvb2RRfFpLAj7kMAvE/2v2vo+VRH79EjIUo1WA kwood@Kevins-MacBook-Air.local"
+
+# ---------- GitHub Actions runner (build-vm.md §6a) ----------
+gha_runner_install: true
+gha_runner_user: gha-runner
+gha_runner_dir: /opt/actions-runner
+gha_runner_version: "2.338.2"
+gha_runner_sha256: baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
+gha_runner_repo: woodez-ansible/infra-test-setup
+gha_runner_name: compute02
+gha_runner_labels: [compute02, vm-builder]   # GitHub adds self-hosted, Linux, X64
+gha_runner_venv: "{{ vm_builder_dir }}/venv" # Ansible for CI jobs
+gha_runner_ansible_core: "2.21.4"
