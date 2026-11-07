@@ -295,13 +295,18 @@
     - name: Save a readable copy of the plan (shown in the GitHub job summary)
       ansible.builtin.shell: |
         set -euo pipefail
+        # The file may belong to another vm-builder member (kwood vs gha-runner): only its
+        # owner may chmod it, so write a new file and rename it over (needs only write
+        # access to the shared, setgid directory).
         out={{ vm_builder_dir }}/plans/{{ vm.name }}.txt
+        tmp=$(mktemp "$out.XXXXXX")
         if [ "{{ has_changes | bool }}" = "True" ]; then
-          TF_WORKSPACE={{ vm.name }} terraform show -no-color {{ plan_file }} > "$out"
+          TF_WORKSPACE={{ vm.name }} terraform show -no-color {{ plan_file }} > "$tmp"
         else
-          echo "No changes. {{ vm.name }} already matches its spec." > "$out"
+          echo "No changes. {{ vm.name }} already matches its spec." > "$tmp"
         fi
-        chmod 0664 "$out"
+        chmod 0664 "$tmp"
+        mv -f "$tmp" "$out"
       args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
       environment: "{{ tf_env }}"
       changed_when: false
