@@ -270,11 +270,10 @@
         replacing: >-
           {{ changes | selectattr('address', 'in', ['libvirt_domain.vm', 'libvirt_volume.root'])
              | selectattr('change.actions', 'contains', 'delete') | list | length > 0 }}
-        # In-place domain update that changes vCPU or RAM: needs a restart to take effect
-        resizing: >-
-          {{ dom.change.actions | default([]) == ['update']
-             and ((dom.change.before.memory | default(0)) != (dom.change.after.memory | default(0))
-                  or (dom.change.before.vcpu | default(0)) != (dom.change.after.vcpu | default(0))) }}
+        # ANY in-place update of the domain restarts the VM: provider 0.9.9 updates a
+        # running domain by stop (clean guest shutdown, forced after 30 s), redefine,
+        # start. Seen on 2026-11-07 when a description-only change restarted test01.
+        restarting: "{{ dom.change.actions | default([]) == ['update'] }}"
       vars:
         dom: "{{ changes | selectattr('address', 'eq', 'libvirt_domain.vm') | first | default({}) }}"
 
@@ -293,10 +292,11 @@
 
     - name: Refuse to restart a running VM unless allowed
       ansible.builtin.assert:
-        that: not (resizing | bool) or creating or vm_allow_restart | bool
+        that: not (restarting | bool) or creating or vm_allow_restart | bool
         fail_msg: >-
-          Changing vCPU/RAM of '{{ vm.name }}' needs a restart.
-          Set vm_allow_restart: true in the spec to allow it.
+          This change restarts '{{ vm.name }}': any in-place change to a VM (vCPU, RAM,
+          description, autostart, ...) makes the provider shut it down cleanly (forced
+          after 30 s) and start it again. Set vm_allow_restart: true in the spec to allow it.
         quiet: true
 
     - name: Save a readable copy of the plan (shown in the GitHub job summary)
@@ -341,21 +341,6 @@
         src: "{{ tf_vm_dir }}/.terraform.lock.hcl"
         dest: "{{ repo_root }}/terraform/vm/.terraform.lock.hcl"
         flat: true
-
-    - name: Restart the VM so new vCPU/RAM take effect
-      ansible.builtin.shell: |
-        set -euo pipefail
-        v="virsh -c {{ libvirt_uri }}"
-        $v shutdown {{ vm.name }}
-        for i in $(seq 1 60); do
-          [ "$($v domstate {{ vm.name }})" = "shut off" ] && break
-          sleep 2
-        done
-        [ "$($v domstate {{ vm.name }})" = "shut off" ] || $v destroy {{ vm.name }}
-        $v start {{ vm.name }}
-      args: { executable: /bin/bash }
-      when: has_changes | bool and (resizing | bool) and not creating
-      changed_when: true
 
     # ---------- Find the VM ----------
     - name: Wait for the guest agent to report an IPv4 address

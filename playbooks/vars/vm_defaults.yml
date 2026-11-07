@@ -24,7 +24,7 @@ vm_autostart: true
 vm_firmware: bios                # bios | uefi
 vm_cpu_mode: host-passthrough    # host-passthrough | host-model
 vm_description: ""
-vm_allow_restart: false          # allow a vCPU/RAM change to restart the VM
+vm_allow_restart: false          # allow ANY in-place change (vCPU, RAM, description, ...) to restart the VM
 vm_allow_replace: false          # allow a change that rebuilds the VM (its disk is lost)
 
 # Host-side limits used by the preflight checks

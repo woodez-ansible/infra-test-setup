@@ -265,9 +265,16 @@ would delete the base image that every other VM's disk depends on. So:
 
 **What a re-run can change:**
 
-- **Applied with a reboot of the VM:** vCPU and RAM. The VM is shut down and started
-  again, which needs `vm_allow_restart: true` in the spec (or `-e allow_restart=yes` by
-  hand).
+- **Applied with a restart of the VM: ANY in-place change** to it (vCPU, RAM,
+  description, autostart, …). Provider 0.9.9 updates a running VM by stopping it,
+  redefining it and starting it again. The stop is a clean guest shutdown, forced after
+  30 s. This needs `vm_allow_restart: true` in the spec (or `-e vm_allow_restart=true`
+  by hand). Learned on 2026-11-07, when a description-only change restarted `test01`:
+  the original rule only covered vCPU/RAM, and the playbook's own restart step was
+  redundant (so step 2's RAM test actually restarted `test01` twice). The step was
+  removed. The 30 s limit could be raised with the provider's `update.shutdown.timeout`,
+  but adding that setting is itself an in-place change, so it would restart every
+  existing VM once. It's left at the default for now.
 - **Grown in place:** disk size. Shrinking is refused.
 - **Replaces the VM:** a different Ubuntu release or a new MAC address. Terraform's plan
   shows this, and the run stops unless the spec sets `vm_allow_replace: true` (or
@@ -337,7 +344,7 @@ would delete the base image that every other VM's disk depends on. So:
 |---|---|
 | 2. build `test01` (1 vCPU / 1 GiB / 10 GiB, 26.04) | running, autostart on, guest-agent IP; SSH as kwood from the Mac; `sudo -n` OK; hostname `test01`; `vda` 10G; 26.04.1; Toronto time, synced; 0 pending upgrades |
 | 3. re-run the same build | `changed=0` on compute02 and on the VM; Terraform apply skipped |
-| 4. RAM 1024 → 2048 | **refused** without `vm_allow_restart`, with the VM untouched; with it, the VM restarted and now has 2 GiB (1962 MiB visible in the guest) |
+| 4. RAM 1024 → 2048 | **refused** without `vm_allow_restart`, with the VM untouched; with it, the VM restarted and now has 2 GiB (1962 MiB visible in the guest). (It actually restarted twice: once by the provider, once by a redundant playbook step that has since been removed.) |
 | 5. 24.04 VM, and a second 26.04 VM | `test02` (24.04) and `test03` (26.04) built first time; `test01` and `test03` share `ubuntu-26.04-20261016-base.qcow2` |
 | IP stability (`dhcp-identifier: mac`) | `test02` and `test03` kept their IPs through a reboot, and `test03` through a shutdown and start |
 
