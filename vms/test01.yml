@@ -1,0 +1,8 @@
+---
+# Throwaway VM used to verify the VM builder (build-vm.md §7). Safe to destroy.
+vm_name: test01
+vm_vcpus: 1
+vm_memory_mib: 2048          # raised from 1024 to test a restart (§7 step 4)
+vm_disk_gib: 10
+vm_ubuntu_release: "26.04"
+vm_description: "VM builder test (step 2)"

@@ -1,0 +1,28 @@
+#cloud-config
+hostname: ${name}
+preserve_hostname: false
+timezone: ${timezone}
+
+users:
+  - name: ${user}
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+%{ if passwordless_sudo ~}
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+%{ endif ~}
+    ssh_authorized_keys:
+%{ for key in ssh_authorized_keys ~}
+      - ${key}
+%{ endfor ~}
+
+ssh_pwauth: ${password_login}
+disable_root: true
+
+# Root filesystem grows to the full disk (growpart + resize_rootfs are on by default)
+package_update: true
+packages:
+  - qemu-guest-agent
+
+runcmd:
+  - [systemctl, enable, --now, qemu-guest-agent]

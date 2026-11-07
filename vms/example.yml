@@ -1,0 +1,15 @@
+---
+# Example VM spec. Copy to vms/<name>.yml and set vm_name to <name>.
+# Anything left out uses inventory/group_vars/hypervisors/vm_defaults.yml.
+#   ansible-playbook playbooks/vm-build.yml -e @vms/<name>.yml
+vm_name: example
+vm_vcpus: 2
+vm_memory_mib: 2048
+vm_disk_gib: 20
+vm_ubuntu_release: "26.04"          # "26.04" | "24.04"
+vm_description: "What this VM is for"
+# vm_extra_disks: [{size_gib: 20}]
+# vm_packages: [htop, git]
+# vm_firmware: uefi
+# vm_allow_restart: true            # let a vCPU/RAM change restart the VM
+# vm_allow_replace: true            # let a release/MAC change rebuild the VM (disk lost)

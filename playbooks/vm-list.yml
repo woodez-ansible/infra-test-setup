@@ -1,0 +1,37 @@
+---
+# List VMs on each hypervisor: state, IP, size, and whether the VM builder manages them;
+# plus the RAM and pool space left for new VMs.
+#   ansible-playbook playbooks/vm-list.yml
+- name: List VMs
+  hosts: hypervisors
+  gather_facts: false
+  become: false
+  vars_files:
+    - vars/vm_defaults.yml
+
+  tasks:
+    - name: Collect VM and capacity details
+      ansible.builtin.shell: |
+        set -uo pipefail
+        v="virsh -c {{ libvirt_uri }}"
+        ws_dir="{{ vm_builder_dir }}/vm/terraform.tfstate.d"
+        printf '%-20s %-10s %-15s %5s %8s %8s  %s\n' NAME STATE IP VCPU MEM_MIB DISK_GB MANAGED
+        for d in $($v list --all --name); do
+          state=$($v domstate "$d")
+          vcpu=$($v dominfo "$d" | awk '/^CPU\(s\)/{print $2}')
+          mem=$($v dominfo "$d" | awk '/Max memory/{print int($3/1024)}')
+          disk=$($v domblkinfo "$d" vda 2>/dev/null | awk '/Capacity/{printf "%d", $2/1024/1024/1024}')
+          ip=$($v domifaddr "$d" --source agent 2>/dev/null | awk '$3=="ipv4" && $4 !~ /^127\./{split($4,a,"/"); print a[1]; exit}')
+          managed=$([ -d "$ws_dir/$d" ] && echo yes || echo no)
+          printf '%-20s %-10s %-15s %5s %8s %8s  %s\n' "$d" "$state" "${ip:--}" "$vcpu" "$mem" "${disk:--}" "$managed"
+        done
+        echo
+        echo "Host RAM available: $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MiB (builds keep {{ vm_host_memory_reserve_mib }} MiB in reserve)"
+        echo "Pool {{ libvirt_pool }} free: $($v pool-info {{ libvirt_pool }} | awk '/Available/{print $2, $3}')"
+      args: { executable: /bin/bash }
+      register: vm_list
+      changed_when: false
+
+    - name: Show
+      ansible.builtin.debug:
+        msg: "{{ vm_list.stdout_lines }}"

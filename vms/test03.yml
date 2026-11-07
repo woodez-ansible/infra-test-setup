@@ -1,0 +1,9 @@
+---
+# Throwaway VM used to verify the VM builder (build-vm.md §7): second 26.04 VM on the
+# same base image as test01. Safe to destroy.
+vm_name: test03
+vm_vcpus: 1
+vm_memory_mib: 1024
+vm_disk_gib: 10
+vm_ubuntu_release: "26.04"
+vm_description: "VM builder test (step 2, shared base image)"

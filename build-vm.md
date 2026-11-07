@@ -1,8 +1,8 @@
 # Plan: build Ubuntu VMs on libvirt (compute02) with Terraform + Ansible
 
 Status: **approved 2026-11-06, with the GitHub Actions change approved the same day.
-Step 1 (host preparation and base images) built and verified 2026-11-07;** steps 2–5 are
-not built yet.
+Steps 1 (host preparation, base images) and 2 (build and list VMs) built and verified
+2026-11-07;** steps 3–5 are not built yet.
 
 The goal is that **a VM's settings file in this repo is the VM**:
 
@@ -100,7 +100,10 @@ ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
 ## 4. VM settings: what you can specify
 
 A VM is one small YAML file in `vms/`, reviewed in a PR like any other change.
-Anything you leave out takes the default shown.
+Anything you leave out takes the default shown. Defaults live in
+`playbooks/vars/vm_defaults.yml`, which both plays of `vm-build.yml` load, so the new VM
+sees them as well as the hypervisor. They were first put in `group_vars/hypervisors/`,
+where the VM couldn't see them.
 
 ```yaml
 # vms/web01.yml
@@ -195,6 +198,14 @@ would delete the base image that every other VM's disk depends on. So:
   there's no SSH tunnel inside Terraform.
 - **Domain:** `q35` machine type; virtio disk and NIC; an `org.qemu.guest_agent.0`
   channel; a serial console, so `virsh console web01` works.
+- **Disks are given to libvirt as file paths, not pool/volume names.** This matters
+  for AppArmor: libvirt's `virt-aa-helper` only adds a disk's backing chain to the VM's
+  profile when the disk is file-type. With volume-type disks, QEMU was silently denied
+  the base image ("Permission denied", nothing logged). Base volumes are also created
+  `0644`; that wasn't the cause, but it's right for shared, read-only images.
+- **cloud-init content changes are ignored after creation** (`ignore_changes`).
+  cloud-init only reads its config on first boot, so rebuilding the config disk of an
+  existing VM achieves nothing.
 - **IP lookup:** the `libvirt_domain_interface_addresses` data source with
   `source = "agent"`. Terraform itself doesn't wait for the IP. Ansible polls for it, so
   a slow first boot can't hang or fail the `apply`.
@@ -208,7 +219,14 @@ would delete the base image that every other VM's disk depends on. So:
   - growpart, so the root filesystem fills the disk
   - the timezone
 - **`network-config` (v2):** DHCP on the first NIC. It matches the NIC by MAC address,
-  because interface names differ between machine types.
+  because interface names differ between machine types, and sets
+  **`dhcp-identifier: mac`**. Without it, systemd-networkd identifies the VM to the DHCP
+  server by a DUID rather than its MAC: `test01` came back from a shutdown and start on a
+  new IP (`.141` → `.119`). With it, `test03` kept its IP through the same sequence, and
+  a MAC-based reservation on the router works.
+- **First-build upgrade:** the full upgrade runs until the marker file
+  `/var/lib/vm-builder/baseline-done` exists. That file is written only when the
+  baseline completes, so a first run that fails part-way still gets upgraded next time.
 
 ## 6. Playbooks
 
@@ -286,6 +304,18 @@ would delete the base image that every other VM's disk depends on. So:
    - a PR from a fork runs only `vm-validate` on GitHub's runners; the runner's job
      history shows nothing ran on compute02
 
+### Step 2 results (2026-11-07)
+
+| Test | Result |
+|---|---|
+| 2. build `test01` (1 vCPU / 1 GiB / 10 GiB, 26.04) | running, autostart on, guest-agent IP; SSH as kwood from the Mac; `sudo -n` OK; hostname `test01`; `vda` 10G; 26.04.1; Toronto time, synced; 0 pending upgrades |
+| 3. re-run the same build | `changed=0` on compute02 and on the VM; Terraform apply skipped |
+| 4. RAM 1024 → 2048 | **refused** without `vm_allow_restart`, with the VM untouched; with it, the VM restarted and now has 2 GiB (1962 MiB visible in the guest) |
+| 5. 24.04 VM, and a second 26.04 VM | `test02` (24.04) and `test03` (26.04) built first time; `test01` and `test03` share `ubuntu-26.04-20261016-base.qcow2` |
+| IP stability (`dhcp-identifier: mac`) | `test02` and `test03` kept their IPs through a reboot, and `test03` through a shutdown and start |
+
+`test01`–`test03` stay up until step 3 tests `vm-destroy.yml` on them.
+
 ## 8. Delivery
 
 Per your git rules, the work goes on a branch with a PR rather than straight onto
@@ -332,8 +362,13 @@ actions, the base `master` ruleset) are applied now, ahead of the build.
   are started again, that shrinks. The preflight check refuses builds that don't fit.
 - **The libvirt provider rewrote its schema in v0.9.** Older 0.7/0.8 examples you find
   online won't work. The plan pins 0.9.9 and uses its documented resources.
-- **AppArmor** confines each VM to its own files; copy-on-write disks inside the pool
-  directory are allowed. If a backing-chain permission error appears in testing, the
-  fix is a per-domain AppArmor rule, *not* `security_driver = "none"`.
+- **Provider quirk: volumes can't be updated.** Changing an attribute of an existing
+  volume shows as an in-place update in `terraform plan`, but the apply fails with
+  "Storage volumes cannot be updated". For base volumes (`prevent_destroy`), that means
+  a deliberate, one-time recreate when nothing uses them, as happened on 2026-11-07 to
+  add `0644`.
+- **AppArmor** confines each VM to its own files. The backing-chain problem this item
+  warned about did happen. It was solved without weakening AppArmor, by giving libvirt
+  file-type disks (see "Terraform details"). Never set `security_driver = "none"`.
 - **Terraform's licence** (BSL) is fine for internal use. OpenTofu could replace it
   later with no code changes.
