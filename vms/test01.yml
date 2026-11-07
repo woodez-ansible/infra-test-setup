@@ -5,4 +5,4 @@ vm_vcpus: 1
 vm_memory_mib: 1024
 vm_disk_gib: 10
 vm_ubuntu_release: "26.04"
-vm_description: "VM builder test (step 5, built by GitHub Actions)"
+vm_description: "VM builder test (step 5, updated by GitHub Actions)"
