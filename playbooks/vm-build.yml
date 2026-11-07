@@ -274,6 +274,11 @@
         # running domain by stop (clean guest shutdown, forced after 30 s), redefine,
         # start. Seen on 2026-11-07 when a description-only change restarted test01.
         restarting: "{{ dom.change.actions | default([]) == ['update'] }}"
+        # Provider 0.9.9 can't update a volume ("Storage volumes cannot be updated"):
+        # an in-place change such as a bigger vm_disk_gib would only fail at apply.
+        resizing_volume: >-
+          {{ changes | selectattr('address', 'match', '^libvirt_volume[.]')
+             | selectattr('change.actions', 'eq', ['update']) | list | length > 0 }}
       vars:
         dom: "{{ changes | selectattr('address', 'eq', 'libvirt_domain.vm') | first | default({}) }}"
 
@@ -288,6 +293,15 @@
         fail_msg: >-
           This change would REBUILD '{{ vm.name }}' and its root disk would be lost.
           Set vm_allow_replace: true in the spec if that's intended.
+        quiet: true
+
+    - name: Refuse volume changes the provider can't apply
+      ansible.builtin.assert:
+        that: not (resizing_volume | bool)
+        fail_msg: >-
+          This change resizes a disk of '{{ vm.name }}' (e.g. a bigger vm_disk_gib), which
+          the libvirt provider can't do in place: the apply would fail. Revert vm_disk_gib;
+          for more space add a disk with vm_extra_disks (needs vm_allow_restart: true).
         quiet: true
 
     - name: Refuse to restart a running VM unless allowed
