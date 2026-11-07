@@ -1,0 +1,113 @@
+---
+# Destroy one VM built by vm-build.yml: its domain, disks and cloud-init ISO.
+#   ansible-playbook playbooks/vm-destroy.yml -e vm_name=<name> -e confirm=yes
+# Only VMs that have a VM-builder Terraform workspace can be destroyed; anything else
+# on the host (db01, hand-made VMs) is refused. Base images are never touched.
+- name: Destroy a VM
+  hosts: hypervisors
+  gather_facts: false
+  become: false
+  vars_files:
+    - vars/vm_defaults.yml
+
+  vars:
+    tf_root: "{{ vm_builder_dir }}"
+    tf_vm_dir: "{{ vm_builder_dir }}/vm"
+    tf_env:
+      TF_PLUGIN_CACHE_DIR: "{{ vm_builder_dir }}/.plugin-cache"
+      TF_IN_AUTOMATION: "1"
+      TF_WORKSPACE: "{{ vm_name | default('') }}"
+
+  pre_tasks:
+    - name: Require a VM name and explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined
+          - vm_name is match('^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$')
+          - confirm | default('') == 'yes'
+        fail_msg: >-
+          This permanently deletes the VM and its disks.
+          Re-run with -e vm_name=<name> -e confirm=yes
+        quiet: true
+
+  tasks:
+    - name: Check the VM is managed by the VM builder
+      ansible.builtin.shell: |
+        set -uo pipefail
+        ws="{{ tf_vm_dir }}/terraform.tfstate.d/{{ vm_name }}"
+        echo "managed=$([ -d "$ws" ] && echo yes || echo no)"
+        echo "tfvars=$([ -f "{{ tf_root }}/vms/{{ vm_name }}.tfvars.json" ] && echo yes || echo no)"
+        echo "domain=$(virsh -c {{ libvirt_uri }} dominfo {{ vm_name }} >/dev/null 2>&1 && echo yes || echo no)"
+        echo "mem_mib=$(virsh -c {{ libvirt_uri }} dominfo {{ vm_name }} 2>/dev/null | awk '/Max memory/{print int($3/1024)}' || true)"
+        echo "ip=$(virsh -c {{ libvirt_uri }} domifaddr {{ vm_name }} --source agent 2>/dev/null | awk '$3=="ipv4" && $4 !~ /^127\./{split($4,a,"/"); print a[1]; exit}' || true)"
+      args: { executable: /bin/bash }
+      register: vm_check
+      changed_when: false
+
+    - name: Parse VM state
+      ansible.builtin.set_fact:
+        target: "{{ dict(vm_check.stdout_lines | map('split', '=', 1)) }}"
+
+    - name: Refuse to destroy a VM the builder didn't create
+      ansible.builtin.assert:
+        that: target.managed == 'yes' and target.tfvars == 'yes'
+        fail_msg: >-
+          '{{ vm_name }}' is not a VM-builder VM (no Terraform workspace
+          {{ tf_vm_dir }}/terraform.tfstate.d/{{ vm_name }}). Nothing was changed.
+          {{ 'A libvirt domain with that name exists; remove it by hand if you really mean to.' if target.domain == 'yes' else '' }}
+        quiet: true
+
+    - name: Show what will be destroyed
+      ansible.builtin.command: >-
+        terraform state list
+      args: { chdir: "{{ tf_vm_dir }}" }
+      environment: "{{ tf_env }}"
+      register: tf_resources
+      changed_when: false
+
+    - name: Terraform destroy
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        terraform destroy -input=false -no-color -auto-approve \
+          -var-file={{ tf_root }}/vms/{{ vm_name }}.tfvars.json
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      register: tf_destroy
+      changed_when: true
+
+    - name: Remove the workspace, variables and saved plan
+      ansible.builtin.shell: |
+        set -euo pipefail
+        terraform workspace select -no-color default >/dev/null
+        terraform workspace delete -no-color {{ vm_name }}
+        rm -f {{ tf_root }}/vms/{{ vm_name }}.tfvars.json {{ tf_root }}/plans/{{ vm_name }}.tfplan
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env | combine({'TF_WORKSPACE': ''}) }}"
+      changed_when: true
+
+    - name: Forget the VM's SSH host key on this machine
+      ansible.builtin.known_hosts:
+        name: "{{ target.ip }}"
+        state: absent
+      delegate_to: localhost
+      when: target.ip | length > 0
+
+    - name: Confirm the domain and its volumes are gone
+      ansible.builtin.shell: |
+        v="virsh -c {{ libvirt_uri }}"
+        echo "domain=$($v dominfo {{ vm_name }} >/dev/null 2>&1 && echo still-there || echo gone)"
+        echo "volumes=$($v vol-list {{ libvirt_pool }} | awk '{print $1}' | grep -cE '^{{ vm_name }}(\.qcow2|-disk[0-9]+\.qcow2|-cloudinit\.iso)$' || true)"
+        echo "mem_avail_mib=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
+      args: { executable: /bin/bash }
+      register: after
+      changed_when: false
+      failed_when: "'domain=gone' not in after.stdout or 'volumes=0' not in after.stdout"
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Destroyed {{ vm_name }}: {{ tf_resources.stdout_lines | length }} resources ({{ tf_resources.stdout_lines | join(', ') }})"
+          - "{{ after.stdout_lines }}"
+          - "Freed about {{ target.mem_mib | default('?') }} MiB RAM. Base images were not touched."
+          - "Remove vms/{{ vm_name }}.yml from the repo if it's still there."

@@ -1,8 +1,8 @@
 # Plan: build Ubuntu VMs on libvirt (compute02) with Terraform + Ansible
 
 Status: **approved 2026-11-06, with the GitHub Actions change approved the same day.
-Steps 1 (host preparation, base images) and 2 (build and list VMs) built and verified
-2026-11-07;** steps 3–5 are not built yet.
+Steps 1 (host preparation, base images), 2 (build and list VMs) and 3 (destroy VMs)
+built and verified 2026-11-07;** steps 4–5 are not built yet.
 
 The goal is that **a VM's settings file in this repo is the VM**:
 
@@ -234,7 +234,7 @@ would delete the base image that every other VM's disk depends on. So:
 |---|---|---|
 | `hypervisor-prep.yml` | compute02 (sudo), run once from the Mac | adds the HashiCorp apt repo and installs `terraform=1.17.1-*` (held); creates group `vm-builder` and `/opt/vm-builder`, with a pinned Ansible venv for CI; runs `terraform -chdir=images apply`; sets up the state backup; checks `virt-host-validate`; **installs the GitHub runner** (see section 6a) |
 | `vm-build.yml` | compute02, then the new VM | steps 1–8 of section 3; re-running it with changed settings updates the VM in place where libvirt allows (see below) |
-| `vm-destroy.yml` | compute02 | needs `-e confirm=yes`; `terraform destroy` in that VM's workspace, removes the workspace and its tfvars, reports the space freed |
+| `vm-destroy.yml` | compute02 | needs `-e vm_name=<name> -e confirm=yes`. **Only destroys VMs the builder created** (it refuses any name without a builder workspace, so db01 and hand-made VMs are safe). Runs `terraform destroy` in that VM's workspace, removes the workspace, tfvars and saved plan, removes the VM's SSH host key from the machine running Ansible, checks the domain and its volumes are gone, and reports the RAM freed |
 | `vm-list.yml` | compute02 | table of VMs with state, IP (from the agent), vCPU, RAM and disk, plus free host RAM and pool space |
 
 **What a re-run can change:**
@@ -314,7 +314,20 @@ would delete the base image that every other VM's disk depends on. So:
 | 5. 24.04 VM, and a second 26.04 VM | `test02` (24.04) and `test03` (26.04) built first time; `test01` and `test03` share `ubuntu-26.04-20261016-base.qcow2` |
 | IP stability (`dhcp-identifier: mac`) | `test02` and `test03` kept their IPs through a reboot, and `test03` through a shutdown and start |
 
-`test01`–`test03` stay up until step 3 tests `vm-destroy.yml` on them.
+### Step 3 results (2026-11-07)
+
+| Test | Result |
+|---|---|
+| 6. destroy `test01` | 4 resources destroyed (VM, root disk, cloud-init ISO, config disk); 0 `test01` volumes left; workspace removed; **both base images byte-identical** before and after; `test02` and `test03` stayed up throughout; ~3 GiB pool space returned; known_hosts entry for its IP removed |
+| 7a. destroy without `confirm=yes` | refused |
+| 7b. destroy unmanaged `node03` with `confirm=yes` | **refused**: "not a VM-builder VM … Nothing was changed" |
+| 7c. build with the name of unmanaged `node03` | refused |
+| 7d. build needing 16 GiB RAM | refused: "needs 16384 MiB more, but only 8549 MiB is available" |
+| 7e. build named `Web_01` | refused: invalid spec |
+
+For 7a–7e, every libvirt domain, domain state and pool volume was identical before and
+after, and no Terraform workspace was created. `test02` and `test03` remain running for
+step 5's GitHub Actions tests; `vms/test01.yml` was removed along with its VM.
 
 ## 8. Delivery
 
