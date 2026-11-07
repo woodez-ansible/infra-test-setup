@@ -1,8 +1,0 @@
----
-# Throwaway VM used to verify GitHub Actions GitOps (build-vm.md §7 step 8). Safe to destroy.
-vm_name: test01
-vm_vcpus: 1
-vm_memory_mib: 1024
-vm_disk_gib: 10
-vm_ubuntu_release: "26.04"
-vm_description: "VM builder test (step 5, updated by GitHub Actions)"
