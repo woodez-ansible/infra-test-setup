@@ -108,7 +108,10 @@
         set -euo pipefail
         terraform workspace select -no-color default >/dev/null
         terraform workspace delete -no-color {{ vm_name }}
-        rm -f {{ tf_root }}/vms/{{ vm_name }}.tfvars.json {{ tf_root }}/plans/{{ vm_name }}.tfplan
+        rm -f {{ tf_root }}/vms/{{ vm_name }}.tfvars.json \
+              {{ tf_root }}/plans/{{ vm_name }}.tfplan \
+              {{ tf_root }}/plans/{{ vm_name }}.txt \
+              {{ tf_root }}/plans/{{ vm_name }}-destroy.txt
       args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
       environment: "{{ tf_env | combine({'TF_WORKSPACE': ''}) }}"
       changed_when: true

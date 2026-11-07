@@ -1,8 +1,0 @@
----
-# Throwaway VM used to verify the VM builder (build-vm.md §7): Ubuntu 24.04. Safe to destroy.
-vm_name: test02
-vm_vcpus: 1
-vm_memory_mib: 1024
-vm_disk_gib: 10
-vm_ubuntu_release: "24.04"
-vm_description: "VM builder test (step 2, 24.04)"
