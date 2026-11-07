@@ -1,0 +1,142 @@
+# GitOps for VMs on compute02: the spec files in vms/ on master ARE the VMs.
+#
+#   plan            (self-hosted runner, no approval) reconcile EVERYTHING:
+#                     - plan every vms/<name>.yml (build or update)
+#                     - plan a destroy for every builder-managed VM without a spec
+#                   Readable plans go to the job summary. Only VMs with real changes
+#                   go on to the approval jobs.
+#   apply-destroy   waits for approval in environment "vm-destroy", then destroys
+#   apply-build     waits for approval in environment "vm-build", then applies the
+#                   exact saved plan and configures the VM
+#
+# Reconciling everything (rather than "what this push changed") makes a cancelled or
+# skipped run harmless: the next run catches up. Runs are serialized; only reviewed code
+# on master ever runs on the self-hosted runner (no pull_request trigger here).
+name: vm-gitops
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - vms/**
+      - terraform/**
+      - playbooks/vm-*.yml
+      - playbooks/vars/**
+      - inventory/group_vars/hypervisors/**
+      - .github/workflows/vm-gitops.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-gitops
+  cancel-in-progress: false
+
+env:
+  ANSIBLE_CONFIG: ci/ansible.cfg
+  ANSIBLE_FORCE_COLOR: "0"
+  AP: /opt/vm-builder/venv/bin/ansible-playbook
+  PLANS: /opt/vm-builder/plans
+
+jobs:
+  plan:
+    runs-on: [self-hosted, compute02, vm-builder]
+    timeout-minutes: 30
+    outputs:
+      builds: ${{ steps.reconcile.outputs.builds }}
+      destroys: ${{ steps.reconcile.outputs.destroys }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate specs
+        run: /opt/vm-builder/venv/bin/python ci/validate_vm_spec.py
+
+      - name: Plan builds/updates and destroys
+        id: reconcile
+        run: |
+          set -euo pipefail
+          builds=(); destroys=()
+          {
+            echo "## VM plan for \`${GITHUB_SHA::7}\`"
+            echo "Approve the pending deployments below to apply. VMs not listed under"
+            echo "*changes* already match their spec."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          specs=()
+          for f in vms/*.yml; do
+            n=$(basename "$f" .yml); [ "$n" = example ] && continue
+            specs+=("$n")
+            echo "::group::plan $n"
+            "$AP" playbooks/vm-build.yml -e "@$f" -e vm_phase=plan
+            echo "::endgroup::"
+            if [ -f "$PLANS/$n.tfplan" ]; then
+              builds+=("$n")
+              { echo "### $n: changes"; echo '```'; cat "$PLANS/$n.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          for ws in $(ls /opt/vm-builder/vm/terraform.tfstate.d/ 2>/dev/null); do
+            if ! printf '%s\n' "${specs[@]}" | grep -qx "$ws"; then
+              echo "::group::plan destroy $ws (no spec in vms/)"
+              "$AP" playbooks/vm-destroy.yml -e vm_name="$ws" -e confirm=yes -e vm_phase=plan
+              echo "::endgroup::"
+              destroys+=("$ws")
+              { echo "### $ws: DESTROY (its spec was removed)"; echo '```'; cat "$PLANS/$ws-destroy.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          [ ${#builds[@]} -eq 0 ] && [ ${#destroys[@]} -eq 0 ] && echo "**No changes:** every VM matches its spec." >> "$GITHUB_STEP_SUMMARY"
+          to_json() { printf '%s\n' "$@" | jq -R . | jq -cs 'map(select(length > 0))'; }
+          echo "builds=$(to_json "${builds[@]}")" >> "$GITHUB_OUTPUT"
+          echo "destroys=$(to_json "${destroys[@]}")" >> "$GITHUB_OUTPUT"
+          echo "builds: ${builds[*]:-none}; destroys: ${destroys[*]:-none}"
+
+  apply-destroy:
+    needs: plan
+    if: needs.plan.outputs.destroys != '[]'
+    runs-on: [self-hosted, compute02, vm-builder]
+    environment: vm-destroy
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        vm: ${{ fromJSON(needs.plan.outputs.destroys) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Destroy ${{ matrix.vm }}
+        run: |
+          "$AP" playbooks/vm-destroy.yml -e vm_name="${{ matrix.vm }}" -e confirm=yes -e vm_phase=apply
+          echo "### Destroyed \`${{ matrix.vm }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  apply-build:
+    needs: [plan, apply-destroy]
+    # Run after destroys (they free RAM) or when there were none; stop if a destroy failed
+    # or was rejected.
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.builds != '[]'
+      && (needs.apply-destroy.result == 'success' || needs.apply-destroy.result == 'skipped')
+    runs-on: [self-hosted, compute02, vm-builder]
+    environment: vm-build
+    timeout-minutes: 60
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        vm: ${{ fromJSON(needs.plan.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply ${{ matrix.vm }}
+        run: |
+          set -o pipefail
+          "$AP" playbooks/vm-build.yml -e "@vms/${{ matrix.vm }}.yml" -e vm_phase=apply | tee "$RUNNER_TEMP/out.log"
+          ready=$(grep -oE "VM ${{ matrix.vm }} ready at [0-9.]+" "$RUNNER_TEMP/out.log" | tail -1 || true)
+          mac=$(grep -oE "MAC [0-9a-f:]{17}" "$RUNNER_TEMP/out.log" | tail -1 || true)
+          echo "### \`${{ matrix.vm }}\`: ${ready:-applied} ${mac:+($mac)}" >> "$GITHUB_STEP_SUMMARY"

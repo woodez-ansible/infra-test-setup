@@ -3,6 +3,9 @@
 #   ansible-playbook playbooks/vm-build.yml -e @vms/<name>.yml
 # Re-running with a changed spec updates the VM. A vCPU/RAM change needs
 # vm_allow_restart: true; a change that rebuilds the VM needs vm_allow_replace: true.
+#
+# vm_phase (default all): GitHub Actions runs "plan" (saves the plan + a readable copy,
+# then stops), waits for approval, then runs "apply" (applies exactly that saved plan).
 
 # ---------------------------------------------------------------------------
 - name: Plan and apply the VM on the hypervisor
@@ -19,6 +22,8 @@
       TF_PLUGIN_CACHE_DIR: "{{ vm_builder_dir }}/.plugin-cache"
       TF_IN_AUTOMATION: "1"
     repo_root: "{{ inventory_dir }}/.."
+    vm_phase: all                     # all | plan | apply
+    plan_file: "{{ vm_builder_dir }}/plans/{{ vm_name }}.tfplan"
     derived_mac: >-
       {%- set h = vm_name | hash('md5') -%}
       52:54:00:{{ h[0:2] }}:{{ h[2:4] }}:{{ h[4:6] }}
@@ -39,6 +44,7 @@
           - vm_ssh_authorized_keys | length > 0
           - vm_extra_disks | map(attribute='size_gib') | select('integer') | list | length == vm_extra_disks | length
           - vm_passwordless_sudo or vm_password_login
+          - vm_phase in ['all', 'plan', 'apply']
         fail_msg: >-
           Invalid spec. Check: vm_name (lowercase, digits, '-', max 32), vm_vcpus 1-16,
           vm_memory_mib 512-16384, vm_disk_gib 5-500, vm_ubuntu_release in
@@ -200,6 +206,7 @@
         - "{{ tf_vm_dir }}/terraform.tfstate.d"
 
     - name: Terraform plan
+      when: vm_phase in ['all', 'plan']
       ansible.builtin.shell: |
         set -uo pipefail
         umask 0002
@@ -213,13 +220,34 @@
       changed_when: false
       failed_when: tf_plan.rc not in [0, 2]
 
+    # terraform plan -out writes a file even when nothing changes; deleting that file is
+    # housekeeping of this run's own output, not a change to the VM.
+    - name: Remove the plan file when there's nothing to change (so apply can't run a stale one)
+      ansible.builtin.file:
+        path: "{{ plan_file }}"
+        state: absent
+      when: vm_phase in ['all', 'plan'] and tf_plan.rc == 0
+      changed_when: false
+
+    - name: Find the saved plan (apply phase)
+      ansible.builtin.stat:
+        path: "{{ plan_file }}"
+      register: saved_plan
+      when: vm_phase == 'apply'
+
+    - name: Note whether there are changes to apply
+      ansible.builtin.set_fact:
+        has_changes: >-
+          {{ (tf_plan.rc | default(0)) == 2 if vm_phase in ['all', 'plan']
+             else saved_plan.stat.exists }}
+
     - name: Read the plan as JSON
       ansible.builtin.command: terraform show -json {{ tf_root }}/plans/{{ vm.name }}.tfplan
       args: { chdir: "{{ tf_vm_dir }}" }
       environment: "{{ tf_env | combine({'TF_WORKSPACE': vm.name}) }}"
       register: tf_plan_json
       changed_when: false
-      when: tf_plan.rc == 2
+      when: has_changes | bool
 
     - name: Collect the planned changes
       ansible.builtin.set_fact:
@@ -246,7 +274,7 @@
     - name: Show planned changes
       ansible.builtin.debug:
         msg: "{{ changes | map(attribute='address') | zip(changes | map(attribute='change.actions') | map('join', '/')) | map('join', ': ') | list }}"
-      when: tf_plan.rc == 2
+      when: has_changes | bool
 
     - name: Refuse to rebuild an existing VM unless allowed
       ansible.builtin.assert:
@@ -264,16 +292,36 @@
           Set vm_allow_restart: true in the spec to allow it.
         quiet: true
 
+    - name: Save a readable copy of the plan (shown in the GitHub job summary)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        out={{ vm_builder_dir }}/plans/{{ vm.name }}.txt
+        if [ "{{ has_changes | bool }}" = "True" ]; then
+          TF_WORKSPACE={{ vm.name }} terraform show -no-color {{ plan_file }} > "$out"
+        else
+          echo "No changes. {{ vm.name }} already matches its spec." > "$out"
+        fi
+        chmod 0664 "$out"
+      args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      changed_when: false
+      when: vm_phase == 'plan'
+
+    - name: Stop here in the plan phase (approval happens in GitHub)
+      ansible.builtin.meta: end_play
+      when: vm_phase == 'plan'
+
     # ---------- Apply ----------
     - name: Terraform apply
       ansible.builtin.shell: |
         set -euo pipefail
         umask 0002
         export TF_WORKSPACE={{ vm.name }}
-        terraform apply -input=false -no-color {{ tf_root }}/plans/{{ vm.name }}.tfplan
+        terraform apply -input=false -no-color {{ plan_file }}
+        rm -f {{ plan_file }}   # a plan is applied once
       args: { chdir: "{{ tf_vm_dir }}", executable: /bin/bash }
       environment: "{{ tf_env }}"
-      when: tf_plan.rc == 2
+      when: has_changes | bool
       changed_when: true
 
     - name: Keep the provider lock file in the repo
@@ -294,7 +342,7 @@
         [ "$($v domstate {{ vm.name }})" = "shut off" ] || $v destroy {{ vm.name }}
         $v start {{ vm.name }}
       args: { executable: /bin/bash }
-      when: tf_plan.rc == 2 and (resizing | bool) and not creating
+      when: has_changes | bool and (resizing | bool) and not creating
       changed_when: true
 
     # ---------- Find the VM ----------

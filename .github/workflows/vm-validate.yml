@@ -1,0 +1,79 @@
+# Static checks for VM specs and the VM-builder code. Runs on GitHub-hosted runners
+# ONLY: pull-request code never reaches the self-hosted runner on compute02.
+# Required status check on master ("vm-validate").
+name: vm-validate
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.17.1"
+  TERRAFORM_SHA256: 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+
+jobs:
+  vm-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools (Ansible, PyYAML, Terraform)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet ansible-core==2.21.4 pyyaml==6.0.3
+          "$RUNNER_TEMP/venv/bin/ansible-galaxy" collection install --upgrade \
+            'community.general:>=13.0.0,<14.0.0' -p "$RUNNER_TEMP/collections" >/dev/null
+          cd "$RUNNER_TEMP"
+          curl -fsSLo tf.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "${TERRAFORM_SHA256}  tf.zip" | sha256sum -c -
+          unzip -q tf.zip terraform -d "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: VM specs (schema, ranges, file name = vm_name, no unknown keys)
+        run: python ci/validate_vm_spec.py
+
+      - name: All YAML parses
+        run: |
+          python - <<'EOF'
+          import pathlib, sys, yaml
+          bad = []
+          for p in sorted(pathlib.Path(".").rglob("*.y*ml")):
+              if ".git" in p.parts or "vault.yml" in p.name:
+                  continue
+              try:
+                  list(yaml.safe_load_all(p.read_text()))
+              except yaml.YAMLError as e:
+                  bad.append(f"{p}: {e}")
+          print("\n".join(bad) or "all YAML files parse")
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - name: Terraform fmt + validate
+        run: |
+          terraform fmt -check -recursive -diff terraform/
+          for m in terraform/images terraform/vm; do
+            terraform -chdir="$m" init -backend=false -input=false -no-color >/dev/null
+            terraform -chdir="$m" validate -no-color
+          done
+
+      - name: Ansible syntax check (VM builder playbooks)
+        env:
+          ANSIBLE_CONFIG: ci/ansible.cfg
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: |
+          ansible-playbook --syntax-check playbooks/hypervisor-prep.yml
+          ansible-playbook --syntax-check playbooks/vm-list.yml
+          ansible-playbook --syntax-check playbooks/vm-build.yml -e vm_name=syntax-check
+          ansible-playbook --syntax-check playbooks/vm-destroy.yml -e vm_name=syntax-check -e confirm=yes

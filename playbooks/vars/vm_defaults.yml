@@ -11,8 +11,10 @@ vm_ubuntu_release: "26.04"
 vm_bridge: "{{ vm_bridge_default }}"
 vm_mac: ""                       # empty = derived from vm_name (stable per name)
 vm_user: kwood
-# Public keys from the machine running Ansible (the Mac, or the CI runner in step 5)
-vm_ssh_authorized_keys: "{{ lookup('ansible.builtin.pipe', 'cat ' ~ lookup('env', 'HOME') ~ '/.ssh/id_*.pub 2>/dev/null || true') | split('\n') | select | list }}"
+# Admin keys (group_vars/hypervisors) plus the public keys of the machine running
+# Ansible: the Mac, or the GitHub runner. Without the admin keys a CI-built VM would
+# only accept the runner's key.
+vm_ssh_authorized_keys: "{{ (vm_admin_authorized_keys | default([]) + lookup('ansible.builtin.pipe', 'cat ' ~ lookup('env', 'HOME') ~ '/.ssh/id_*.pub 2>/dev/null || true') | split('\n') | select | list) | map('trim') | unique | list }}"
 vm_passwordless_sudo: true
 vm_password_login: false
 vm_timezone: America/Toronto

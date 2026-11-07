@@ -1,0 +1,9 @@
+---
+# Inventory for GitHub Actions jobs running ON compute02 (see ci/ansible.cfg).
+# Only the hypervisors group, so no other group's vault files are ever loaded.
+all:
+  children:
+    hypervisors:
+      hosts:
+        compute02:
+          ansible_connection: local

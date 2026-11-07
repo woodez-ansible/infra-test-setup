@@ -270,3 +270,207 @@
           - "Terraform {{ (tf_version.stdout | from_json).terraform_version }}"
           - "{{ vols.stdout_lines | select('search', '-base\\.qcow2') | map('trim') | list }}"
           - "virt-host-validate warnings: {{ vhv.stdout_lines | select('search', 'WARN') | map('regex_replace', '\\s+', ' ') | list }}"
+
+# ---------------------------------------------------------------------------
+# GitHub Actions self-hosted runner for vm-gitops.yml (build-vm.md §6a).
+#   install (default):  ansible-playbook playbooks/hypervisor-prep.yml
+#   remove:             ansible-playbook playbooks/hypervisor-prep.yml -e gha_runner_remove=yes
+- name: GitHub Actions runner on the hypervisor
+  hosts: hypervisors
+  become: true
+
+  vars:
+    runner_tarball: "actions-runner-linux-x64-{{ gha_runner_version }}.tar.gz"
+    runner_url: "https://github.com/{{ gha_runner_repo }}"
+    remove: "{{ gha_runner_remove | default(false) | bool }}"
+
+  tasks:
+    - name: Skip when the runner isn't wanted
+      ansible.builtin.meta: end_play
+      when: not (gha_runner_install | bool) and not remove
+
+    # ---------- Remove ----------
+    - name: Remove the runner
+      when: remove
+      block:
+        - name: Get a removal token
+          ansible.builtin.command: gh api -X POST repos/{{ gha_runner_repo }}/actions/runners/remove-token --jq .token
+          register: rm_token
+          changed_when: false
+          no_log: true
+          delegate_to: localhost
+          become: false
+          vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+        - name: Stop and uninstall the service, then unregister
+          ansible.builtin.shell: |
+            set -u
+            cd {{ gha_runner_dir }} || exit 0
+            ./svc.sh stop || true
+            ./svc.sh uninstall || true
+            sudo -u {{ gha_runner_user }} ./config.sh remove --token "$TOKEN" || true
+          environment:
+            TOKEN: "{{ rm_token.stdout }}"
+          changed_when: true
+          no_log: true
+
+        - name: Delete the runner directory
+          ansible.builtin.file:
+            path: "{{ gha_runner_dir }}"
+            state: absent
+
+        - name: Done
+          ansible.builtin.meta: end_play
+
+    # ---------- User ----------
+    - name: Install runner prerequisites
+      ansible.builtin.apt:
+        name: [acl, git, python3-venv, jq]
+        state: present
+
+    - name: Create the {{ gha_runner_user }} user
+      ansible.builtin.user:
+        name: "{{ gha_runner_user }}"
+        system: true
+        shell: /bin/bash
+        create_home: true
+        groups: [libvirt, kvm, "{{ vm_builder_group }}"]
+        append: true
+        generate_ssh_key: true          # used to reach VMs it builds
+        ssh_key_type: ed25519
+        ssh_key_comment: "{{ gha_runner_user }}@{{ inventory_hostname }}"
+
+    # You chose passwordless sudo for the runner (build-vm.md §9 explains the risk).
+    - name: Give {{ gha_runner_user }} passwordless sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/{{ gha_runner_user }}
+        content: "{{ gha_runner_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        mode: "0440"
+        validate: visudo -cf %s
+
+    # ---------- Ansible for CI jobs ----------
+    - name: Create the CI Ansible venv
+      ansible.builtin.pip:
+        name: "ansible-core=={{ gha_runner_ansible_core }}"
+        virtualenv: "{{ gha_runner_venv }}"
+        virtualenv_command: python3 -m venv
+
+    - name: Install collections the playbooks use
+      ansible.builtin.command: >-
+        {{ gha_runner_venv }}/bin/ansible-galaxy collection install
+        'community.general:>=13.0.0,<14.0.0' -p {{ vm_builder_dir }}/collections
+      args:
+        creates: "{{ vm_builder_dir }}/collections/ansible_collections/community/general"
+
+    - name: Make the venv and collections readable by {{ vm_builder_group }}
+      ansible.builtin.file:
+        path: "{{ item }}"
+        group: "{{ vm_builder_group }}"
+        mode: g+rX
+        recurse: true
+      loop:
+        - "{{ gha_runner_venv }}"
+        - "{{ vm_builder_dir }}/collections"
+
+    # ---------- Runner ----------
+    - name: Create {{ gha_runner_dir }}
+      ansible.builtin.file:
+        path: "{{ gha_runner_dir }}"
+        state: directory
+        owner: "{{ gha_runner_user }}"
+        group: "{{ gha_runner_user }}"
+        mode: "0750"
+
+    - name: Download runner {{ gha_runner_version }} (SHA-256 verified)
+      ansible.builtin.get_url:
+        url: "https://github.com/actions/runner/releases/download/v{{ gha_runner_version }}/{{ runner_tarball }}"
+        dest: "{{ gha_runner_dir }}/{{ runner_tarball }}"
+        checksum: "sha256:{{ gha_runner_sha256 }}"
+        owner: "{{ gha_runner_user }}"
+        mode: "0640"
+
+    - name: Unpack runner
+      ansible.builtin.unarchive:
+        src: "{{ gha_runner_dir }}/{{ runner_tarball }}"
+        dest: "{{ gha_runner_dir }}"
+        remote_src: true
+        owner: "{{ gha_runner_user }}"
+        group: "{{ gha_runner_user }}"
+        creates: "{{ gha_runner_dir }}/config.sh"
+
+    - name: Install the runner's OS dependencies
+      ansible.builtin.command: ./bin/installdependencies.sh
+      args:
+        chdir: "{{ gha_runner_dir }}"
+        creates: "{{ gha_runner_dir }}/.deps-installed"
+      register: deps
+
+    - name: Record that dependencies are installed
+      ansible.builtin.file:
+        path: "{{ gha_runner_dir }}/.deps-installed"
+        state: touch
+        mode: "0644"
+      when: deps is changed
+
+    - name: Check whether the runner is registered
+      ansible.builtin.stat:
+        path: "{{ gha_runner_dir }}/.runner"
+      register: runner_cfg
+
+    - name: Register the runner
+      when: not runner_cfg.stat.exists
+      block:
+        - name: Get a short-lived registration token (your gh login)
+          ansible.builtin.command: gh api -X POST repos/{{ gha_runner_repo }}/actions/runners/registration-token --jq .token
+          register: reg_token
+          changed_when: false
+          no_log: true
+          delegate_to: localhost
+          become: false
+          vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+        - name: Configure the runner (repo-level)
+          ansible.builtin.command: >-
+            ./config.sh --unattended --replace
+            --url {{ runner_url }} --token {{ reg_token.stdout }}
+            --name {{ gha_runner_name }} --labels {{ gha_runner_labels | join(',') }}
+            --work _work
+          args:
+            chdir: "{{ gha_runner_dir }}"
+          become_user: "{{ gha_runner_user }}"
+          no_log: true
+
+    - name: Install the runner as a systemd service
+      ansible.builtin.command: ./svc.sh install {{ gha_runner_user }}
+      args:
+        chdir: "{{ gha_runner_dir }}"
+        creates: "{{ gha_runner_dir }}/.service"
+
+    - name: Find the service name
+      ansible.builtin.slurp:
+        src: "{{ gha_runner_dir }}/.service"
+      register: svc_file
+
+    - name: Start and enable the runner service
+      ansible.builtin.systemd_service:
+        name: "{{ svc_file.content | b64decode | trim }}"
+        state: started
+        enabled: true
+
+    # ---------- Check ----------
+    - name: Wait for GitHub to show the runner online
+      ansible.builtin.command: >-
+        gh api repos/{{ gha_runner_repo }}/actions/runners
+        --jq '.runners[] | select(.name=="{{ gha_runner_name }}") | "\(.status) \([.labels[].name] | join(","))"'
+      register: runner_status
+      until: runner_status.stdout is search('^online')
+      retries: 12
+      delay: 5
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      vars: { ansible_python_interpreter: "{{ ansible_playbook_python }}" }
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Runner {{ gha_runner_name }}: {{ runner_status.stdout }} (service {{ svc_file.content | b64decode | trim }})"
