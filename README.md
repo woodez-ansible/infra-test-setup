@@ -155,3 +155,14 @@ section 8 of [k8s-howto-3node.md](k8s-howto-3node.md).
 ansible-playbook playbooks/k8s/65-cicd.yml                                         # runners (once)
 ansible-playbook playbooks/k8s/app-onboard.yml -e app=myapp -e repo=woodez/myapp   # per app
 ```
+
+## Ubuntu VMs on compute02 (GitOps)
+
+Each `vms/<name>.yml` on `master` is a VM on compute02 (192.168.2.6). Merge a change, then
+approve it in **Actions → vm-gitops**; deleting a spec destroys that VM after approval.
+How-to, settings reference, operations and troubleshooting: [build-vm.md](build-vm.md).
+
+```bash
+cp vms/example.yml vms/web01.yml          # set vm_name: web01 (= file name), size, release
+ansible-playbook playbooks/vm-list.yml    # what's running, IPs, free RAM/pool
+```

@@ -1,25 +1,141 @@
-# Plan: build Ubuntu VMs on libvirt (compute02) with Terraform + Ansible
+# Ubuntu VMs on compute02: how-to (GitOps with GitHub Actions, Terraform, Ansible)
 
-Status: **approved 2026-11-06, with the GitHub Actions change approved the same day.
-Steps 1 (host preparation, base images), 2 (build and list VMs) and 3 (destroy VMs)
-built and verified 2026-11-07;** steps 4–5 are not built yet.
+**Status:** built and verified on 2026-11-07 (steps 1–5). Part A below is how to use and
+run it. Part B is the original design, the decisions behind it and the test results.
 
-The goal is that **a VM's settings file in this repo is the VM**:
+**In one sentence:** each file `vms/<name>.yml` on `master` *is* a VM on compute02
+(192.168.2.6). Merging a change plans it on a GitHub runner on compute02, and nothing is
+applied until you approve it in GitHub.
 
-1. Add or edit `vms/web01.yml` in a pull request.
-2. Merge it, and GitHub Actions plans the change on a runner on compute02.
-3. You approve, and it builds or updates the VM.
-4. Deleting the file, after approval, destroys the VM.
-
-The same code also runs by hand from the Mac as a fallback:
-
-```bash
-ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml
+```
+PR edits vms/<name>.yml ──► vm-validate (GitHub's runners: checks only, never touches compute02)
+merge to master ─────────► vm-gitops on the compute02 runner
+                             plan   every spec + every builder VM without a spec (no approval)
+                             ⏸ you approve in "vm-build" / "vm-destroy"
+                             apply  exactly the plan you saw, one VM at a time
 ```
 
-The playbook runs Terraform on the hypervisor to create the VM, waits for it to boot
-and get a DHCP address, then connects over SSH and applies a baseline.
-`vm-destroy.yml` removes a VM again.
+---
+
+# Part A: how-to
+
+## A1. Add a VM
+
+1. Copy the example and edit it. **The file name must equal `vm_name`.**
+   ```bash
+   cp vms/example.yml vms/web01.yml     # then set vm_name: web01, size, release...
+   ```
+   Every setting is optional except `vm_name`; see the table in **§4** (Part B).
+   Common ones: `vm_vcpus`, `vm_memory_mib`, `vm_disk_gib`, `vm_ubuntu_release`
+   (`"26.04"` or `"24.04"`, quoted), `vm_packages`, `vm_description`.
+2. Open a PR. **`vm-validate`** must pass: it checks the spec (ranges, choices, file name
+   = `vm_name`, **unknown keys are errors**, so typos can't fall back to defaults silently),
+   the Terraform code and the Ansible syntax. Fix and push until it's green.
+3. Merge. Then go to **Actions → vm-gitops** (latest run):
+   - the **plan** job's summary shows exactly what will be created
+   - a yellow **Review deployments** banner appears: tick **vm-build** → **Approve and
+     deploy** (or **Reject**)
+4. When `apply-build` finishes, its summary shows the VM's **IP and MAC**. Log in with
+   `ssh kwood@<ip>`. Your Mac's key (`vm_admin_authorized_keys`) and the runner's key are
+   both installed, and `sudo` needs no password.
+5. **Pin the IP:** add a DHCP reservation on the router for the MAC shown. The MAC is
+   derived from the VM name, so it stays the same across rebuilds.
+
+Timing, measured on `test01`: the plan job took 28 s. The apply took about 4.5 minutes
+after approval, most of it the first-boot `apt` upgrade, then the baseline (timezone,
+chrony, packages).
+
+## A2. Change a VM
+
+Edit its spec in a PR, merge, approve. What happens depends on the change:
+
+| Change | Effect | Needs in the spec |
+|---|---|---|
+| `vm_disk_gib` (any change) | **refused at plan time**. Provider 0.9.9 can't change a volume in place ("Storage volumes cannot be updated"), so the apply would only fail. For more space, add a disk with `vm_extra_disks`, which restarts the VM | (not possible) |
+| **Any other in-place change**: `vm_vcpus`, `vm_memory_mib`, `vm_description`, `vm_autostart`, ... | the VM **restarts**: clean shutdown, forced after 30 s, then started again | `vm_allow_restart: true` |
+| `vm_ubuntu_release`, `vm_mac` | the VM is **rebuilt** and its **disk is lost** | `vm_allow_replace: true` |
+| `vm_packages`, `vm_timezone` | **not applied by GitOps on their own.** They're baseline settings, not Terraform ones, so the plan says "No changes" and nothing is applied. Apply them with the manual fallback (A4: `vm-build.yml -e @vms/<name>.yml`), or together with a change that Terraform does see | nothing |
+| `vm_user`, `vm_ssh_authorized_keys`, `vm_password_login`, `vm_passwordless_sudo` | **ignored for an existing VM**: cloud-init only reads them on first boot | (rebuild to change) |
+
+Without the needed flag, the **plan job fails** with a message explaining why, and nothing
+is applied. Remove `vm_allow_restart`/`vm_allow_replace` again after the change, so a later
+edit can't restart or rebuild the VM by accident.
+
+## A3. Remove a VM
+
+Delete `vms/<name>.yml` in a PR and merge. The plan shows **"<name>: DESTROY (its spec was
+removed)"** with every resource that will be deleted. Approve in **vm-destroy**. The VM, its
+disks and its Terraform workspace are deleted; base images and other VMs are never touched.
+
+**Any VM the builder manages but has no spec on `master` is proposed for destruction on
+every run.** If you see a destroy you didn't expect, **Reject** it, then add the spec back.
+
+## A4. Without GitHub (manual fallback from the Mac)
+
+Same code and settings, run directly. You need the repo's venv; no approvals are
+involved, so you are the approval.
+
+```bash
+source .venv/bin/activate
+ansible-playbook playbooks/vm-list.yml                                      # VMs, IPs, sizes, free RAM/pool
+ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml                   # build/update (plan + apply)
+ansible-playbook playbooks/vm-build.yml -e @vms/web01.yml -e vm_phase=plan  # plan only, change nothing
+ansible-playbook playbooks/vm-destroy.yml -e vm_name=web01 -e confirm=yes   # destroy
+```
+
+Commit the spec afterwards. Otherwise the next GitOps run will propose destroying the VM
+(see A3).
+
+## A5. Operations
+
+| Task | How |
+|---|---|
+| Is the runner up? | GitHub → Settings → Actions → Runners (`compute02`, Idle/Active), or `systemctl status actions.runner.woodez-ansible-infra-test-setup.compute02` on compute02 |
+| Restart the runner | `sudo systemctl restart actions.runner.woodez-ansible-infra-test-setup.compute02` |
+| Re-install / upgrade the runner | change `gha_runner_version` + `gha_runner_sha256` in `inventory/group_vars/hypervisors/vars.yml` (the SHA-256 is in the release notes), remove, then re-run `hypervisor-prep.yml` |
+| Remove the runner | `ansible-playbook playbooks/hypervisor-prep.yml -e gha_runner_remove=yes` |
+| Re-run prep (idempotent) | `ansible-playbook playbooks/hypervisor-prep.yml`; a clean host reports `changed=0` |
+| Newer Ubuntu image | add the new dated build (URL + SHA-256 from `SHA256SUMS`) under `ubuntu_images` in `group_vars/hypervisors/vars.yml`, run `hypervisor-prep.yml`. A new base volume is added; existing VMs keep theirs |
+| Capacity | `vm-list.yml`; builds refuse to start if RAM (keeping 1 GiB reserve) or pool space don't fit |
+| State backups | nightly in `/var/backups/vm-builder/state-*.tgz` (14 days). Restore: stop the runner, untar over `/opt/vm-builder` |
+| Re-run a plan by hand | Actions → vm-gitops → **Run workflow**: reconciles everything, same approvals |
+
+## A6. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| **`ssh` says "REMOTE HOST IDENTIFICATION HAS CHANGED"** for a VM's IP | A rebuilt VM got an IP your Mac knew from an older VM (DHCP reuse); CI builds clean `known_hosts` on the runner, not your Mac. **Check before trusting:** on compute02 run `sudo -u gha-runner sh -c 'ssh-keygen -F <ip> -f ~/.ssh/known_hosts \| ssh-keygen -lf -'`. That's the key the runner saw right after building. If it matches the fingerprint ssh shows you: `ssh-keygen -R <ip>`, then connect again |
+| Plan job fails: "This change restarts …" / "would REBUILD …" | Expected guard. Add `vm_allow_restart: true` / `vm_allow_replace: true` if you mean it (A2) |
+| Plan job fails: "This change resizes a disk …" | Disks can't be resized by this provider. Revert `vm_disk_gib`, and add space with `vm_extra_disks` (A2) |
+| Plan job fails: "Not enough RAM" / pool space | Free capacity or shrink the spec; see `vm-list.yml` |
+| Plan job fails: "… already exists but isn't managed by the VM builder" | The name belongs to a hand-made VM (e.g. `node03`); pick another name. The builder never touches unmanaged VMs |
+| `vm-validate` fails: "unknown setting" | A typo in a key (e.g. `vm_memroy_mib`); see §4 |
+| Jobs stay "Queued" / "Waiting for a runner" | Runner offline: check and restart it (A5) |
+| A run shows "failure" after you clicked **Reject** | Normal: GitHub marks rejected deployments as failed. Nothing was applied |
+| The VM's IP changed after a restart | Should not happen: VMs identify to DHCP by MAC (`dhcp-identifier: mac`). Add a router reservation for the MAC to pin it |
+| `Permission denied` under `/opt/vm-builder` in CI | Something there isn't group-writable for `vm-builder` (kwood and gha-runner share it). Re-run `hypervisor-prep.yml`, which fixes Terraform's own files |
+| VM fails to start: "Could not open … base.qcow2: Permission denied" | Disks must be file-type in `terraform/vm` (AppArmor only allows a disk's backing chain for file-type disks); see §5 "Terraform details". Never set `security_driver = "none"` |
+| `terraform plan` says a volume will be updated in place, but apply fails "Storage volumes cannot be updated" | Provider quirk: any volume change means recreate. For base images (`prevent_destroy`) do a deliberate one-time recreate when nothing uses them |
+
+## A7. Safety rules (public repo, root-capable runner)
+
+- **Never** add a `pull_request` or `pull_request_target` trigger to a job that runs on
+  `[self-hosted, compute02, vm-builder]`. Only `vm-validate` runs on PRs, and only on
+  GitHub's runners.
+- Keep the `master-protection` ruleset: PR required, `vm-validate` required, no
+  force-push or deletion.
+- Keep both environments' required reviewer, and their `master`-only branch policy.
+- Pin new actions to a full commit SHA with a `# vX.Y.Z` comment; allowed actions are
+  limited to GitHub-owned ones.
+- `gha-runner` has passwordless sudo on the host that runs db01. Anything merged to
+  `master` can run as root there, so review workflow and playbook changes carefully.
+
+---
+
+# Part B: design, decisions and build history
+
+The original plan as approved, kept as the record of *why* things are the way they are,
+with the findings and test results from building it.
 
 ## 1. Decisions
 
@@ -137,7 +253,7 @@ vm_ubuntu_release: "26.04"   # "26.04" | "24.04"
 | `vm_name` | **required** | lowercase letters, digits and `-`; becomes the hostname and the domain name |
 | `vm_vcpus` | `2` | checked against free host CPUs (warning only; CPUs can be shared) |
 | `vm_memory_mib` | `2048` | **hard check**: must fit in available host RAM minus a 1 GiB reserve |
-| `vm_disk_gib` | `20` | root disk; it grows the base image, which is about 3.5 GB |
+| `vm_disk_gib` | `20` | root disk; it grows the base image, which is about 3.5 GB. **Fixed after creation** (the provider can't resize volumes); use `vm_extra_disks` for more |
 | `vm_extra_disks` | `[]` | e.g. `[{size_gib: 20}]`; blank qcow2 disks, left unformatted |
 | `vm_ubuntu_release` | `"26.04"` | selects the base image |
 | `vm_bridge` | `br0` | |
@@ -275,7 +391,7 @@ would delete the base image that every other VM's disk depends on. So:
   removed. The 30 s limit could be raised with the provider's `update.shutdown.timeout`,
   but adding that setting is itself an in-place change, so it would restart every
   existing VM once. It's left at the default for now.
-- **Grown in place:** disk size. Shrinking is refused.
+- **Disk size: not changeable.** Planned as "grown in place", but provider 0.9.9 can't update volumes, so `vm-build.yml` refuses any `vm_disk_gib` change at plan time (found while writing the how-to, 2026-11-07). Use `vm_extra_disks` for more space.
 - **Replaces the VM:** a different Ubuntu release or a new MAC address. Terraform's plan
   shows this, and the run stops unless the spec sets `vm_allow_replace: true` (or
   `-e allow_replace=yes` by hand).
@@ -363,6 +479,30 @@ For 7a–7e, every libvirt domain, domain state and pool volume was identical be
 after, and no Terraform workspace was created. `test02` and `test03` remain running for
 step 5's GitHub Actions tests; `vms/test01.yml` was removed along with its VM.
 
+### Step 5 results (2026-11-07): GitHub Actions end-to-end
+
+| Test | Result |
+|---|---|
+| 1. no-change run | plan on `compute02`: "builds: none; destroys: none"; no approvals asked |
+| 2. add `vms/test01.yml`, approve | built by CI after approval in `vm-build`; reachable from the Mac with the admin key (and the runner's key); sudo, 26.04, 10G, synced Toronto time |
+| 5. reject | `apply-build` never ran (no runner, 0 steps); VM untouched (description unchanged, no restart) |
+| 3. approve an update (manual run) | applied. Found that **any** in-place change restarts the VM, now gated by `vm_allow_restart` (PR #11) |
+| 4. delete the spec, approve | `apply-destroy` in `vm-destroy`: 4 resources destroyed, 0 volumes, workspace gone; base images byte-identical; other VMs untouched |
+| PRs | only `vm-validate` ever ran for PR branches; nothing reached the runner |
+
+**Found and fixed during these runs** (each verified as `gha-runner` before its PR):
+
+- **#7:** a plan summary file owned by `kwood` couldn't be chmod-ed by `gha-runner`. It's
+  now written with temp file + rename.
+- **#9:** the provider's cloud-init ISOs were in `/tmp`: a shared subdirectory owned by
+  the first user, and wiped on reboot, after which every VM planned changes. They're now
+  in persistent, group-writable `/opt/vm-builder/cloudinit-tmp`.
+- **#11:** a description-only change restarted the VM, because provider 0.9.9 stops,
+  redefines and starts for any update. Any update now needs `vm_allow_restart`, and the
+  redundant playbook restart step was removed.
+- The Mac's `known_hosts` kept a stale key for a reused DHCP IP. It was verified against
+  the VM's own key and replaced; the procedure is in A6.
+
 ## 8. Delivery
 
 Per your git rules, the work goes on a branch with a PR rather than straight onto
@@ -374,6 +514,9 @@ Per your git rules, the work goes on a branch with a PR rather than straight ont
 4. Turn this plan into a how-to section in this file, with a reference for every setting
 5. GitHub runner + `vm-validate.yml` + `vm-gitops.yml` + `ci/`, the environments, and
    the `vm-validate` required check, then verify (step 8)
+
+All five steps are done (PRs #3–#5 for steps 1–3, #6–#12 for step 5 with its fixes, plus
+this how-to for step 4).
 
 The three repo settings that don't depend on the workflows (fork PR approval, allowed
 actions, the base `master` ruleset) are applied now, ahead of the build.
