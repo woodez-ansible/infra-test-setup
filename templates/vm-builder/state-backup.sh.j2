@@ -1,0 +1,22 @@
+#!/bin/sh
+# {{ ansible_managed }}
+# Copy every Terraform state file under {{ vm_builder_dir }} into a dated archive.
+set -eu
+
+src={{ vm_builder_dir }}
+dst={{ vm_builder_backup_dir }}
+keep={{ vm_builder_backup_keep_days }}
+ts=$(date +%Y%m%d-%H%M%S)
+
+mkdir -p "$dst"
+cd "$src"
+files=$(find . -path ./cache -prune -o -path ./.plugin-cache -prune -o \
+        \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' \) -print)
+if [ -z "$files" ]; then
+  echo "no state files under $src"; exit 0
+fi
+# shellcheck disable=SC2086
+tar -czf "$dst/state-$ts.tgz" $files
+chmod 600 "$dst/state-$ts.tgz"
+find "$dst" -name 'state-*.tgz' -mtime +"$keep" -delete
+echo "backup ok: $dst/state-$ts.tgz ($(echo "$files" | wc -l) files)"

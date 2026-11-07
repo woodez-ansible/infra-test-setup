@@ -1,0 +1,272 @@
+---
+# One-time (re-runnable) preparation of a libvirt hypervisor for VM builds.
+#   ansible-playbook playbooks/hypervisor-prep.yml
+# Installs Terraform, sets up /opt/vm-builder, downloads + verifies the Ubuntu base
+# images and loads them into the libvirt pool (terraform/images), and backs up state.
+- name: Prepare hypervisor for Terraform VM builds
+  hosts: hypervisors
+  become: true
+
+  vars:
+    tf_images_dir: "{{ vm_builder_dir }}/images"
+    tf_cache_dir: "{{ vm_builder_dir }}/cache"
+    tf_plugin_cache: "{{ vm_builder_dir }}/.plugin-cache"
+    repo_root: "{{ inventory_dir }}/.."
+
+  tasks:
+    # ---------- Terraform ----------
+    # A hand-made HashiCorp repo entry (2025) pins a keyring without HashiCorp's current
+    # signing key, which breaks `apt update`; two entries for one repo with different
+    # Signed-By values is also an apt error. Replace it with the managed deb822 source.
+    - name: Remove legacy HashiCorp apt entry and its outdated keyring
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/hashicorp.list
+        - /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, gpg]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Add HashiCorp apt repository
+      ansible.builtin.deb822_repository:
+        name: hashicorp
+        types: deb
+        uris: https://apt.releases.hashicorp.com
+        suites: "{{ ansible_facts['distribution_release'] }}"
+        components: main
+        signed_by: https://apt.releases.hashicorp.com/gpg
+        state: present
+
+    - name: Install Terraform {{ terraform_version }}
+      ansible.builtin.apt:
+        name: "terraform={{ terraform_version }}-*"
+        state: present
+        update_cache: true
+        allow_change_held_packages: true
+
+    - name: Hold Terraform at {{ terraform_version }}
+      ansible.builtin.dpkg_selections:
+        name: terraform
+        selection: hold
+
+    # ---------- Shared group and directories ----------
+    - name: Create group {{ vm_builder_group }}
+      ansible.builtin.group:
+        name: "{{ vm_builder_group }}"
+        system: true
+
+    - name: Add VM builders to {{ vm_builder_group }} and libvirt
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: ["{{ vm_builder_group }}", libvirt]
+        append: true
+      loop: "{{ vm_builder_users }}"
+      register: builder_groups
+
+    - name: Reconnect so new group membership applies to this session
+      ansible.builtin.meta: reset_connection
+      when: builder_groups is changed
+
+    - name: Create {{ vm_builder_dir }} tree (setgid, group-writable)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: "{{ vm_builder_group }}"
+        mode: "2775"
+      loop:
+        - "{{ vm_builder_dir }}"
+        - "{{ tf_images_dir }}"
+        - "{{ tf_cache_dir }}"
+        - "{{ tf_plugin_cache }}"
+
+    # ---------- Base images: download + verify ----------
+    - name: Download Ubuntu cloud images (SHA-256 verified)
+      ansible.builtin.get_url:
+        url: "{{ item.value.url }}"
+        dest: "{{ tf_cache_dir }}/ubuntu-{{ item.key }}-{{ item.value.build }}.img"
+        checksum: "sha256:{{ item.value.sha256 }}"
+        owner: root
+        group: "{{ vm_builder_group }}"
+        mode: "0644"
+        timeout: 600
+      loop: "{{ ubuntu_images | dict2items }}"
+      loop_control: { label: "{{ item.key }} ({{ item.value.build }})" }
+
+    # ---------- terraform/images ----------
+    - name: Copy terraform/images code
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ tf_images_dir }}/"
+        owner: root
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+      with_fileglob:
+        - "{{ repo_root }}/terraform/images/*.tf"
+        - "{{ repo_root }}/terraform/images/.terraform.lock.hcl"
+
+    - name: Write image variables file
+      ansible.builtin.template:
+        src: "{{ repo_root }}/templates/vm-builder/images.auto.tfvars.json.j2"
+        dest: "{{ tf_images_dir }}/images.auto.tfvars.json"
+        owner: root
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+
+    - name: Terraform init (as {{ ansible_user | default('kwood') }}, group-writable files)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        terraform init -input=false -no-color
+      args:
+        chdir: "{{ tf_images_dir }}"
+        executable: /bin/bash
+      environment:
+        TF_PLUGIN_CACHE_DIR: "{{ tf_plugin_cache }}"
+        TF_IN_AUTOMATION: "1"
+      become: false
+      register: tf_init
+      changed_when: "'Installing dmacvicar/libvirt' in tf_init.stdout"
+
+    # terraform init creates .terraform/ and the lock file without group write, whatever
+    # the umask, which would stop other vm-builder members (gha-runner) re-initialising.
+    - name: Make Terraform's working files group-writable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: g+rwX
+        group: "{{ vm_builder_group }}"
+        recurse: "{{ item is not search('lock.hcl$') }}"
+      loop:
+        - "{{ tf_images_dir }}/.terraform"
+        - "{{ tf_images_dir }}/.terraform.lock.hcl"
+        - "{{ tf_plugin_cache }}"
+
+    - name: Terraform plan
+      ansible.builtin.shell: |
+        set -uo pipefail
+        umask 0002
+        terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+      args:
+        chdir: "{{ tf_images_dir }}"
+        executable: /bin/bash
+      environment:
+        TF_PLUGIN_CACHE_DIR: "{{ tf_plugin_cache }}"
+        TF_IN_AUTOMATION: "1"
+      become: false
+      register: tf_plan
+      changed_when: false
+      failed_when: tf_plan.rc not in [0, 2]   # 0 = no changes, 2 = changes pending
+
+    - name: Show planned changes
+      ansible.builtin.debug:
+        msg: "{{ tf_plan.stdout_lines | select('search', '^(  [#~+-]|Plan:)') | list }}"
+      when: tf_plan.rc == 2
+
+    - name: Terraform apply (loads base images into pool {{ libvirt_pool }})
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        terraform apply -input=false -no-color tfplan
+      args:
+        chdir: "{{ tf_images_dir }}"
+        executable: /bin/bash
+      environment:
+        TF_PLUGIN_CACHE_DIR: "{{ tf_plugin_cache }}"
+        TF_IN_AUTOMATION: "1"
+      become: false
+      when: tf_plan.rc == 2
+      changed_when: true
+
+    - name: Keep the provider lock file in the repo
+      ansible.builtin.fetch:
+        src: "{{ tf_images_dir }}/.terraform.lock.hcl"
+        dest: "{{ repo_root }}/terraform/images/.terraform.lock.hcl"
+        flat: true
+
+    # ---------- State backups ----------
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ vm_builder_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install state backup script
+      ansible.builtin.template:
+        src: "{{ repo_root }}/templates/vm-builder/state-backup.sh.j2"
+        dest: /usr/local/sbin/vm-builder-state-backup
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install backup service and timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        content: "{{ item.content }}"
+        mode: "0644"
+      loop:
+        - name: vm-builder-state-backup.service
+          content: |
+            [Unit]
+            Description=Back up VM builder Terraform state
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/vm-builder-state-backup
+        - name: vm-builder-state-backup.timer
+          content: |
+            [Unit]
+            Description=Nightly VM builder Terraform state backup
+
+            [Timer]
+            OnCalendar=*-*-* 03:15:00
+            RandomizedDelaySec=10m
+            Persistent=true
+
+            [Install]
+            WantedBy=timers.target
+      loop_control: { label: "{{ item.name }}" }
+
+    - name: Enable backup timer
+      ansible.builtin.systemd_service:
+        name: vm-builder-state-backup.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    # ---------- Checks ----------
+    - name: Check virtualisation support
+      ansible.builtin.command: virt-host-validate qemu
+      register: vhv
+      changed_when: false
+      failed_when: vhv.stdout is search(':\s*FAIL')
+
+    - name: Check Terraform version
+      ansible.builtin.command: terraform version -json
+      register: tf_version
+      changed_when: false
+      failed_when: (tf_version.stdout | from_json).terraform_version != terraform_version
+
+    - name: List base volumes in pool {{ libvirt_pool }}
+      ansible.builtin.command: virsh -c {{ libvirt_uri }} vol-list {{ libvirt_pool }}
+      register: vols
+      changed_when: false
+      become: false
+      failed_when: >-
+        ubuntu_images | dict2items
+        | rejectattr('key', 'in', vols.stdout | regex_findall('ubuntu-([0-9.]+)-[0-9]{8}-base\.qcow2'))
+        | list | length > 0
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Terraform {{ (tf_version.stdout | from_json).terraform_version }}"
+          - "{{ vols.stdout_lines | select('search', '-base\\.qcow2') | map('trim') | list }}"
+          - "virt-host-validate warnings: {{ vhv.stdout_lines | select('search', 'WARN') | map('regex_replace', '\\s+', ' ') | list }}"

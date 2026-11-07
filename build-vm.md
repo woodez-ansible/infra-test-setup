@@ -1,8 +1,8 @@
 # Plan: build Ubuntu VMs on libvirt (compute02) with Terraform + Ansible
 
 Status: **approved 2026-11-06, with the GitHub Actions change approved the same day.
-Not built yet.** Nothing has been changed on compute02. This plan is based on read-only
-checks of compute02 made on 2026-11-06.
+Step 1 (host preparation and base images) built and verified 2026-11-07;** steps 2–5 are
+not built yet.
 
 The goal is that **a VM's settings file in this repo is the VM**:
 
@@ -46,7 +46,7 @@ and get a DHCP address, then connects over SSH and applies a baseline.
 | Storage pools | `default` → `/var/lib/libvirt/images`, 434 GiB, **281 GiB free**; `tmp` → `/var/tmp` |
 | Networks | bridge **`br0`** on `enp1s0` holds 192.168.2.6/24; libvirt NAT network `default` (virbr0, unused) |
 | Existing VMs | `db01.apexkube.xyz` running (6 vCPU / 6 GiB, bridged on br0); `node03`–`node05` shut off |
-| Tools present | `xorriso`; Terraform is not installed |
+| Tools present | `xorriso`. **Terraform 1.11.0 was already installed** (correcting this plan's first version, which said it wasn't), from a hand-made 2025 HashiCorp repo entry whose keyring lacks HashiCorp's current signing key. That broke `apt update`; step 1 replaced the entry and upgraded Terraform to 1.17.1. No existing Terraform state or projects were found on the host |
 | Access | SSH key login works. kwood is in `libvirt` and `kvm`, and has **passwordless sudo** (confirmed 2026-11-06) |
 | Security | AppArmor enforcing, with one `libvirt-<uuid>` profile per VM; `qemu.conf` at defaults apart from the standard `swtpm_user`/`swtpm_group` lines |
 
@@ -172,16 +172,23 @@ build-vm.md                # this plan, then the how-to
 If each VM's state also owned the Ubuntu base image, `terraform destroy` of any one VM
 would delete the base image that every other VM's disk depends on. So:
 
-- `terraform/images` manages `ubuntu-26.04-base.qcow2` and `ubuntu-24.04-base.qcow2`
-  once, in its own state.
+- `terraform/images` manages one base volume per release, in its own state.
+  - Names include the image's build date, e.g. `ubuntu-26.04-20261016-base.qcow2`.
+  - Refreshing an image adds a new volume; it never changes one that VMs are built on.
+- **Images are pinned and verified.** `group_vars/hypervisors/vars.yml` pins each dated
+  cloud-image URL and its SHA-256. Ansible downloads the image to
+  `/opt/vm-builder/cache/` and checks the sum (the provider can't verify checksums),
+  then Terraform loads the volume from that verified local file.
 - VM disks are copy-on-write volumes backed by those images.
-- `terraform/images` refuses to delete a base image while any VM disk still uses it.
+- Base volumes have `prevent_destroy`, so Terraform refuses to delete one.
 
 ### Terraform details
 
 - **Code location:** `/opt/vm-builder` on compute02, owned by group `vm-builder` (setgid,
   group-writable), so `gha-runner` and `kwood` share the same code and state. Terraform's
-  state lock stops them running at the same time. State lives in
+  state lock stops them running at the same time. `terraform init` creates
+  `.terraform/` and the lock file without group write, whatever the umask, so
+  `hypervisor-prep.yml` fixes their permissions after each init. State lives in
   `/opt/vm-builder/vm/terraform.tfstate.d/<name>/` (one directory per workspace).
   `hypervisor-prep.yml` adds a nightly copy of all state to `/var/backups/vm-builder/`.
 - **Provider:** `uri = "qemu:///system"`. Terraform runs locally on compute02, so

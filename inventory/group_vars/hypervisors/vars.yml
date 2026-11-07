@@ -1,0 +1,31 @@
+---
+# ---------- VM builder on the hypervisor (see build-vm.md) ----------
+terraform_version: "1.17.1"
+libvirt_provider_version: "0.9.9"
+
+vm_builder_dir: /opt/vm-builder           # Terraform code, state, image cache
+vm_builder_group: vm-builder              # shared by everyone who runs Terraform here
+vm_builder_users: [kwood]                 # gha-runner is added in step 5
+
+libvirt_uri: qemu:///system
+libvirt_pool: default
+vm_bridge: br0
+
+# Base cloud images. Dated builds, so a base image never changes underneath a VM.
+# To refresh: add the new build here; the old base volume stays until no VM uses it.
+ubuntu_images:
+  "26.04":
+    build: "20261016"
+    url: https://cloud-images.ubuntu.com/releases/resolute/release-20261016/ubuntu-26.04-server-cloudimg-amd64.img
+    sha256: 5645d0318ad21f643ebb1ac4567514620e9893380b07b0201fda163baa5b7eb5
+  "24.04":
+    build: "20261017"
+    url: https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img
+    sha256: 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+
+# Nightly copy of all Terraform state
+vm_builder_backup_dir: /var/backups/vm-builder
+vm_builder_backup_keep_days: 14
+
+# Same time setup as the other hosts
+system_timezone: America/Toronto

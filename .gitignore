@@ -231,3 +231,11 @@ group_vars/**/vault.yml.dec
 # Local-only docs
 CLAUDE.md
 k8-plan.md
+
+# Terraform (state lives on the hypervisor, never in git; the lock file IS committed)
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.auto.tfvars.json
+terraform.tfstate.d/
