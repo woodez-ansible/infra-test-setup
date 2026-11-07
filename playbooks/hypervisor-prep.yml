@@ -85,6 +85,9 @@
         - "{{ tf_images_dir }}"
         - "{{ tf_cache_dir }}"
         - "{{ tf_plugin_cache }}"
+        # Persistent, shared home for the provider's cloud-init ISOs (TMPDIR in vm-build.yml)
+        - "{{ vm_builder_dir }}/cloudinit-tmp"
+        - "{{ vm_builder_dir }}/cloudinit-tmp/terraform-provider-libvirt-cloudinit"
 
     # ---------- Base images: download + verify ----------
     - name: Download Ubuntu cloud images (SHA-256 verified)

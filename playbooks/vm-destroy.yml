@@ -20,6 +20,11 @@
     tf_env:
       TF_PLUGIN_CACHE_DIR: "{{ vm_builder_dir }}/.plugin-cache"
       TF_IN_AUTOMATION: "1"
+      # The libvirt provider writes cloud-init ISOs under $TMPDIR/terraform-provider-libvirt-cloudinit
+      # and records that path in state. /tmp is wiped on reboot (every VM would then plan
+      # changes) and its subdir belongs to whoever ran first (kwood vs gha-runner). Use a
+      # persistent dir whose subdir hypervisor-prep/vm-build create group-writable.
+      TMPDIR: "{{ vm_builder_dir }}/cloudinit-tmp"
       TF_WORKSPACE: "{{ vm_name | default('') }}"
 
   pre_tasks:
