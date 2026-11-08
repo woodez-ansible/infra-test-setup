@@ -61,18 +61,21 @@ cp vms/example.yml vms/web01.yml            # edit: vm_name: web01, size, releas
 source .venv/bin/activate
 python ci/validate_vm_spec.py vms/web01.yml
 
-# 3. Commit, push and open the PR
+# 3. Stage only your spec, check the branch and what will be committed, then commit
 git add vms/web01.yml
+git status -sb          # first line must say "## vms/add-web01"; only vms/web01.yml staged
 git commit -m "vms: add web01"
+
+# 4. Push and open the PR. --head names the branch, so gh never picks another one
 git push -u origin vms/add-web01
-gh pr create --base master --title "vms: add web01" \
+gh pr create --base master --head vms/add-web01 --title "vms: add web01" \
   --body "Adds vms/web01.yml: 2 vCPU, 2 GiB, 20 GiB, Ubuntu 26.04."
 
-# 4. Wait for the required check, then merge with a merge commit
-gh pr checks --watch
-gh pr merge --merge --delete-branch
+# 5. Wait for the required check, then merge with a merge commit
+gh pr checks vms/add-web01 --watch
+gh pr merge vms/add-web01 --merge --delete-branch
 
-# 5. Follow the vm-gitops run the merge started, and open it in the browser to approve
+# 6. Follow the vm-gitops run the merge started, and open it in the browser to approve
 gh run list --workflow vm-gitops.yml --limit 1
 gh run watch "$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 gh run view --web "$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
@@ -88,17 +91,35 @@ finishes, `gh run view <id>` shows the job summary with the VM's IP.
 # Change: edit the spec (add vm_allow_restart: true if it restarts the VM, see A2)
 git switch master && git pull --ff-only && git switch -c vms/resize-web01
 $EDITOR vms/web01.yml && python ci/validate_vm_spec.py vms/web01.yml
-git commit -am "vms: web01 to 4 GiB" && git push -u origin vms/resize-web01
-gh pr create --base master --fill
+git add vms/web01.yml && git status -sb      # on vms/resize-web01, only web01.yml staged
+git commit -m "vms: web01 to 4 GiB" && git push -u origin vms/resize-web01
+gh pr create --base master --head vms/resize-web01 --fill
 
 # Remove: delete the spec, then approve the destroy in "vm-destroy"
 git switch master && git pull --ff-only && git switch -c vms/remove-web01
-git rm vms/web01.yml
+git rm vms/web01.yml && git status -sb       # on vms/remove-web01, only the deletion staged
 git commit -m "vms: remove web01" && git push -u origin vms/remove-web01
-gh pr create --base master --fill
+gh pr create --base master --head vms/remove-web01 --fill
 ```
 
-`--fill` uses the commit message as the PR title and body. Then continue from step 4.
+`--fill` uses the commit message as the PR title and body. Then continue from step 5,
+using your branch name.
+
+**Why these guard rails** (learned on 2026-11-08, when another process switched the
+checkout back to `master` between `git switch -c` and `git commit`):
+
+- **`git status -sb` before committing.** Its first line shows the branch you're on, and
+  the rest lists exactly what's staged. Stop if it says `## master`.
+- **`git add <file>`, never `git commit -a`.** `-a` commits *every* modified file,
+  including unrelated local edits (e.g. to `vms/example.yml`).
+- **`gh pr create --head <branch>`.** Without it, `gh` uses whatever branch is checked
+  out. From `master`, it tries to push `master`, which the ruleset rejects
+  ("Changes must be made through a pull request").
+- **If a commit lands on `master` by mistake:**
+  `git branch -f <branch> <commit>`, then `git switch <branch>`,
+  `git branch -f master origin/master`, `git push`, and
+  `gh pr create --base master --head <branch> --fill`.
+  Nothing is lost; uncommitted edits stay in place.
 
 **Approving from the terminal** (optional; the browser is simpler). This approves every
 deployment waiting in `vm-build` for the latest run. Use the `vm-destroy` environment
