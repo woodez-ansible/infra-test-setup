@@ -166,6 +166,37 @@
         template: template0
       become_user: postgres
 
+    # ---------- Extra application databases (postgres_app_dbs) ----------
+    - name: Create extra application roles
+      community.postgresql.postgresql_user:
+        name: "{{ item.user }}"
+        password: "{{ item.password }}"
+        role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE
+      loop: "{{ postgres_app_dbs | default([]) }}"
+      loop_control: { label: "{{ item.user }}" }
+      become_user: postgres
+      no_log: true
+
+    - name: Create extra application databases (owned by their user)
+      community.postgresql.postgresql_db:
+        name: "{{ item.name }}"
+        owner: "{{ item.user }}"
+        encoding: UTF8
+        template: template0
+      loop: "{{ postgres_app_dbs | default([]) }}"
+      loop_control: { label: "{{ item.name }} -> {{ item.user }}" }
+      become_user: postgres
+
+    - name: Grant ALL on each extra database to its user
+      community.postgresql.postgresql_privs:
+        login_db: "{{ item.name }}"
+        type: database
+        privs: ALL
+        roles: "{{ item.user }}"
+      loop: "{{ postgres_app_dbs | default([]) }}"
+      loop_control: { label: "{{ item.name }} -> {{ item.user }}" }
+      become_user: postgres
+
     # ---------- Firewall ----------
     - name: Allow SSH through UFW (before enabling, to avoid lockout)
       community.general.ufw:

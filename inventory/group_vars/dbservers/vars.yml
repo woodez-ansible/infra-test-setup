@@ -37,3 +37,11 @@ postgres_max_parallel_maintenance_workers: 3
 # Secrets come from vault.yml
 postgres_superuser_password: "{{ vault_postgres_superuser_password }}"
 app_db_password: "{{ vault_app_db_password }}"
+
+# Extra application databases. Each user OWNS its database, so it has full access to
+# it (including the public schema on PostgreSQL 15+) and no access to anything else.
+# Passwords live in vault.yml; never put them here.
+postgres_app_dbs:
+  - name: ragdb
+    user: rag_user
+    password: "{{ vault_rag_db_password }}"
