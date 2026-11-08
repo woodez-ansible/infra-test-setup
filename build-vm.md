@@ -28,9 +28,10 @@ merge to master ─────────► vm-gitops on the compute02 runner
    Every setting is optional except `vm_name`; see the table in **§4** (Part B).
    Common ones: `vm_vcpus`, `vm_memory_mib`, `vm_disk_gib`, `vm_ubuntu_release`
    (`"26.04"` or `"24.04"`, quoted), `vm_packages`, `vm_description`.
-2. Open a PR. **`vm-validate`** must pass: it checks the spec (ranges, choices, file name
-   = `vm_name`, **unknown keys are errors**, so typos can't fall back to defaults silently),
-   the Terraform code and the Ansible syntax. Fix and push until it's green.
+2. Open a PR. The exact commands are in **A1a** below. **`vm-validate`** must pass: it
+   checks the spec (ranges, choices, file name = `vm_name`, **unknown keys are errors**, so
+   typos can't fall back to defaults silently), the Terraform code and the Ansible syntax.
+   Fix and push until it's green.
 3. Merge. Then go to **Actions → vm-gitops** (latest run):
    - the **plan** job's summary shows exactly what will be created
    - a yellow **Review deployments** banner appears: tick **vm-build** → **Approve and
@@ -44,6 +45,76 @@ merge to master ─────────► vm-gitops on the compute02 runner
 Timing, measured on `test01`: the plan job took 28 s. The apply took about 4.5 minutes
 after approval, most of it the first-boot `apt` upgrade, then the baseline (timezone,
 chrony, packages).
+
+## A1a. The exact commands (git + GitHub CLI)
+
+Run from the repo root on the Mac. Changes reach `master` only through a PR: the
+`master-protection` ruleset blocks direct pushes. This example adds `web01`.
+
+```bash
+# 1. Start from an up-to-date master, on a new branch
+git switch master && git pull --ff-only
+git switch -c vms/add-web01
+
+# 2. Write the spec (file name = vm_name) and check it locally, before GitHub does
+cp vms/example.yml vms/web01.yml            # edit: vm_name: web01, size, release...
+source .venv/bin/activate
+python ci/validate_vm_spec.py vms/web01.yml
+
+# 3. Commit, push and open the PR
+git add vms/web01.yml
+git commit -m "vms: add web01"
+git push -u origin vms/add-web01
+gh pr create --base master --title "vms: add web01" \
+  --body "Adds vms/web01.yml: 2 vCPU, 2 GiB, 20 GiB, Ubuntu 26.04."
+
+# 4. Wait for the required check, then merge with a merge commit
+gh pr checks --watch
+gh pr merge --merge --delete-branch
+
+# 5. Follow the vm-gitops run the merge started, and open it in the browser to approve
+gh run list --workflow vm-gitops.yml --limit 1
+gh run watch "$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run view --web "$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+In the browser: **Review deployments** → tick **vm-build** (or **vm-destroy**) →
+**Approve and deploy**, or **Reject**. `gh run watch` keeps showing progress; when it
+finishes, `gh run view <id>` shows the job summary with the VM's IP.
+
+**Same steps for a change or a removal**, with a different branch, file and message:
+
+```bash
+# Change: edit the spec (add vm_allow_restart: true if it restarts the VM, see A2)
+git switch master && git pull --ff-only && git switch -c vms/resize-web01
+$EDITOR vms/web01.yml && python ci/validate_vm_spec.py vms/web01.yml
+git commit -am "vms: web01 to 4 GiB" && git push -u origin vms/resize-web01
+gh pr create --base master --fill
+
+# Remove: delete the spec, then approve the destroy in "vm-destroy"
+git switch master && git pull --ff-only && git switch -c vms/remove-web01
+git rm vms/web01.yml
+git commit -m "vms: remove web01" && git push -u origin vms/remove-web01
+gh pr create --base master --fill
+```
+
+`--fill` uses the commit message as the PR title and body. Then continue from step 4.
+
+**Approving from the terminal** (optional; the browser is simpler). This approves every
+deployment waiting in `vm-build` for the latest run. Use the `vm-destroy` environment
+for removals:
+
+```bash
+R=woodez-ansible/infra-test-setup
+RUN=$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+ENV=$(gh api repos/$R/environments/vm-build --jq .id)
+gh api repos/$R/actions/runs/$RUN/pending_deployments          # what is waiting
+gh api -X POST repos/$R/actions/runs/$RUN/pending_deployments \
+  -F "environment_ids[]=$ENV" -f state=approved -f comment="approved from the CLI"
+```
+
+Use `-f state=rejected` to reject. Only a required reviewer of the environment
+(`kevinwood75`) can approve or reject.
 
 ## A2. Change a VM
 
