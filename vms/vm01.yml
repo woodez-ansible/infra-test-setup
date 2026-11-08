@@ -1,6 +1,0 @@
-vm_name: vm01
-vm_vcpus: 2
-vm_memory_mib: 2048
-vm_disk_gib: 20
-vm_ubuntu_release: "26.04"          # "26.04" | "24.04"
-vm_description: "Test building of vm via pipeline"
