@@ -134,9 +134,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Apply ${{ matrix.vm }}
+        env:
+          # Windows VMs: Ansible's login to the VM (build-windows-vm.md). Only this approved
+          # step gets it; GitHub masks it in logs, and every task that handles it is no_log.
+          WINDOWS_ADMIN_PASSWORD: ${{ secrets.WINDOWS_ADMIN_PASSWORD }}
         run: |
           set -o pipefail
           "$AP" playbooks/vm-build.yml -e "@vms/${{ matrix.vm }}.yml" -e vm_phase=apply | tee "$RUNNER_TEMP/out.log"
-          ready=$(grep -oE "VM ${{ matrix.vm }} ready at [0-9.]+" "$RUNNER_TEMP/out.log" | tail -1 || true)
+          ready=$(grep -oE "VM ${{ matrix.vm }} (\(Windows[^)]*\) )?ready at [0-9.]+" "$RUNNER_TEMP/out.log" | tail -1 || true)
           mac=$(grep -oE "MAC [0-9a-f:]{17}" "$RUNNER_TEMP/out.log" | tail -1 || true)
           echo "### \`${{ matrix.vm }}\`: ${ready:-applied} ${mac:+($mac)}" >> "$GITHUB_STEP_SUMMARY"

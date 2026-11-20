@@ -257,6 +257,20 @@ vm_description: "Windows test VM"
   synced from `*.ca.pool.ntp.org`, RDP reachable from the Mac, `Web-Server` installed (IIS
   answers HTTP 200); re-run `changed=0`; password found **0** times in the playbook logs.
 
+### W4 as built (2026-11-20)
+
+- `vm-gitops.yml`: the **Apply** step of `apply-build` (environment `vm-build`, approval
+  required) gets `WINDOWS_ADMIN_PASSWORD` from the environment secret. Nothing else does:
+  the no-approval `plan` job never needs it (the plan phase stops before any baseline).
+- The job summary also matches the Windows report line (`VM <name> (Windows Server 2022)
+  ready at <ip>`).
+- In GitHub Actions an empty `WINDOWS_ADMIN_PASSWORD` fails with a clear message instead
+  of a vault error (the runner has no vault).
+- `vms/win01.yml` is the first Windows spec built by GitOps.
+- **Don't build long-lived test VMs by hand without a spec:** the reconcile plans a
+  destroy for every builder-managed VM that has no `vms/<name>.yml` (it queued `win01`'s
+  destroy on the W3 merge).
+
 ### WinRM server certificate
 
 cloudbase-init creates a self-signed HTTPS certificate per VM. Ansible connects with
