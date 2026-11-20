@@ -1,7 +1,8 @@
-# Ubuntu VMs on compute02: how-to (GitOps with GitHub Actions, Terraform, Ansible)
+# Ubuntu and Windows VMs on compute02: how-to (GitOps with GitHub Actions, Terraform, Ansible)
 
-**Status:** built and verified on 2026-11-07 (steps 1–5). Part A below is how to use and
-run it. Part B is the original design, the decisions behind it and the test results.
+**Status:** built and verified on 2026-11-07 (steps 1–5); Windows Server 2022 added on
+2026-11-20 (**A8**, design in `build-windows-vm.md`). Part A below is how to use and run
+it. Part B is the original design, the decisions behind it and the test results.
 
 **In one sentence:** each file `vms/<name>.yml` on `master` *is* a VM on compute02
 (192.168.2.6). Merging a change plans it on a GitHub runner on compute02, and nothing is
@@ -27,7 +28,8 @@ merge to master ─────────► vm-gitops on the compute02 runner
    ```
    Every setting is optional except `vm_name`; see the table in **§4** (Part B).
    Common ones: `vm_vcpus`, `vm_memory_mib`, `vm_disk_gib`, `vm_ubuntu_release`
-   (`"26.04"` or `"24.04"`, quoted), `vm_packages`, `vm_description`.
+   (`"26.04"` or `"24.04"`, quoted), `vm_packages`, `vm_description`. For a Windows
+   VM set `vm_os: windows-2022`; see **A8**.
 2. Open a PR. The exact commands are in **A1a** below. **`vm-validate`** must pass: it
    checks the spec (ranges, choices, file name = `vm_name`, **unknown keys are errors**, so
    typos can't fall back to defaults silently), the Terraform code and the Ansible syntax.
@@ -221,6 +223,66 @@ Commit the spec afterwards. Otherwise the next GitOps run will propose destroyin
   limited to GitHub-owned ones.
 - `gha-runner` has passwordless sudo on the host that runs db01. Anything merged to
   `master` can run as root there, so review workflow and playbook changes carefully.
+
+## A8. Windows VMs (Windows Server 2022)
+
+Same GitOps flow as A1–A3; only the spec and the way you connect differ. Design, build
+history and test results: **`build-windows-vm.md`**.
+
+**Add one:**
+```yaml
+# vms/win02.yml
+vm_name: win02                 # at most 15 characters (Windows computer-name limit)
+vm_os: windows-2022
+vm_description: "IIS test"
+vm_windows_features: [Web-Server]   # optional: Windows features/roles
+# defaults: 2 vCPU, 4096 MiB (min 2048), 60 GiB disk (min 40)
+```
+Open the PR, merge, approve **vm-build** (A1a). About 1.5 minutes after approval (95 s
+for `win01`) the
+`apply-build` summary shows `VM win02 (Windows Server 2022) ready at <ip>` and the MAC.
+Linux-only settings (`vm_user`, `vm_ssh_authorized_keys`, `vm_packages`,
+`vm_ubuntu_release`, `vm_firmware`, ...) are rejected in a Windows spec.
+
+**Connect:**
+| How | Details |
+|---|---|
+| **RDP** | `<ip>:3389`, user **`ansible`** (local admin). Network Level Authentication on; LAN only |
+| **Ansible** | WinRM HTTPS 5986, NTLM, user `ansible`, certificate validation off (each VM has its own self-signed cert). The `apply-build` summary prints an inventory line; `vm-build.yml` shows the full set of connection settings (incl. `ansible_winrm_proxy: null`, needed on macOS) |
+| **Console** (when the network is broken) | `virsh vncdisplay <name>` on compute02, then `ssh -L 5900:127.0.0.1:59NN compute02` and a VNC viewer on `localhost:5900` |
+
+**What the baseline sets:** time zone from `vm_timezone` (mapped to a Windows ID in
+`windows_timezone_ids`, `vm_defaults.yml`; add a zone there if yours is missing), NTP to
+`ca.pool.ntp.org`, RDP and WinRM limited to the LAN, `vm_windows_features`. As with
+`vm_packages` (A2), **changing `vm_windows_features` or `vm_timezone` alone isn't applied
+by GitOps**; use the manual fallback (A4) for it.
+
+**The admin password** is the same on every Windows VM and **never changes** (decided
+2026-11-20). It lives in the golden image, `playbooks/vars/windows-vault.yml` (encrypted)
+and the `WINDOWS_ADMIN_PASSWORD` secret of the `vm-build`/`vm-destroy` environments. It's
+never in a spec, Terraform, cloud-init data or logs. Never print it to debug.
+
+**Golden image (monthly, after Patch Tuesday):**
+```bash
+source .venv/bin/activate
+ansible-playbook playbooks/windows-image.yml      # ~70 min on compute02; needs the vault
+```
+It adds a new base volume `windows-2022-<YYYYMMDD>-base.qcow2`. **New** VMs use the newest
+one; existing VMs keep theirs (rebuild a VM to move it: delete its spec, approve the
+destroy, add it back). Each base volume is about 8 GB; old ones stay until removed by hand.
+
+**Licence:** the images use the Server 2022 **Evaluation**: 180 days per VM, lab use only.
+When a VM nears expiry, rebuild it.
+
+**Windows troubleshooting:**
+| Symptom | Cause and fix |
+|---|---|
+| Baseline fails: "WINDOWS_ADMIN_PASSWORD is empty" | The `vm-build` environment secret is missing: `gh secret set WINDOWS_ADMIN_PASSWORD --env vm-build -R woodez-ansible/infra-test-setup` (it prompts) |
+| On the Mac: "A worker was found in a dead state" | macOS fork-safety crash in the proxy lookup. `vm-build.yml` sets `ansible_winrm_proxy: null`; set it too in any inventory of your own that uses WinRM |
+| Apply waits long at "Wait for cloudbase-init to finish" | First boot runs sysprep's OOBE and cloudbase-init (normally ~1 min). Look at the console (VNC, above) |
+| WinRM 401 from `curl --ntlm` | WinRM only offers `Negotiate`; curl's NTLM can't log in. Use Ansible or pywinrm (in `requirements.txt`) |
+| "No windows-2022 base image yet" | Run `playbooks/windows-image.yml` first |
+| Golden image build stuck or failing | `packer.log` in `/var/lib/libvirt/images/.vm-builder-packer/<build>/`; the known traps and their fixes are in `build-windows-vm.md` §4 |
 
 ---
 
