@@ -5,6 +5,8 @@ the file name must equal vm_name, and unknown keys are errors (a typo such as
 vm_memroy_mib would otherwise be silently ignored and the default used).
 
 Usage: python3 ci/validate_vm_spec.py [vms/a.yml ...]   (default: every vms/*.yml)
+The example specs (vms/example*.yml) are checked too, so they stay valid; vm-gitops
+never builds them.
 Exit status is non-zero if any spec is invalid.
 """
 
@@ -17,7 +19,6 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS = ROOT / "playbooks" / "vars" / "vm_defaults.yml"
 HYPERVISOR_VARS = ROOT / "inventory" / "group_vars" / "hypervisors" / "vars.yml"
-SKIP = {"example.yml"}
 
 NAME_RE = re.compile(r"^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$")
 MAC_RE = re.compile(r"^52:54:00(:[0-9a-f]{2}){3}$")
@@ -113,7 +114,6 @@ def check(path: Path, keys: set[str], known_releases: set[str]) -> list[str]:
 
 def main(argv: list[str]) -> int:
     paths = [Path(a) for a in argv] or sorted((ROOT / "vms").glob("*.yml"))
-    paths = [p for p in paths if p.name not in SKIP]
     keys, known_releases = allowed_keys(), releases()
     failed = 0
     for path in paths:

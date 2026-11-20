@@ -147,7 +147,8 @@ Edit its spec in a PR, merge, approve. What happens depends on the change:
 |---|---|---|
 | `vm_disk_gib` (any change) | **refused at plan time**. Provider 0.9.9 can't change a volume in place ("Storage volumes cannot be updated"), so the apply would only fail. For more space, add a disk with `vm_extra_disks`, which restarts the VM | (not possible) |
 | **Any other in-place change**: `vm_vcpus`, `vm_memory_mib`, `vm_description`, `vm_autostart`, ... | the VM **restarts**: clean shutdown, forced after 30 s, then started again | `vm_allow_restart: true` |
-| `vm_ubuntu_release`, `vm_mac` | the VM is **rebuilt** and its **disk is lost** | `vm_allow_replace: true` |
+| `vm_mac` | the VM is **rebuilt** and its **disk is lost** | `vm_allow_replace: true` |
+| `vm_ubuntu_release` | **no effect** on an existing VM: it keeps the base image it was built from (since 2026-11-20). To move it to another release, remove it (A3) and add it again | (rebuild) |
 | `vm_packages`, `vm_timezone` | **not applied by GitOps on their own.** They're baseline settings, not Terraform ones, so the plan says "No changes" and nothing is applied. Apply them with the manual fallback (A4: `vm-build.yml -e @vms/<name>.yml`), or together with a change that Terraform does see | nothing |
 | `vm_user`, `vm_ssh_authorized_keys`, `vm_password_login`, `vm_passwordless_sudo` | **ignored for an existing VM**: cloud-init only reads them on first boot | (rebuild to change) |
 
@@ -226,63 +227,263 @@ Commit the spec afterwards. Otherwise the next GitOps run will propose destroyin
 
 ## A8. Windows VMs (Windows Server 2022)
 
-Same GitOps flow as A1–A3; only the spec and the way you connect differ. Design, build
-history and test results: **`build-windows-vm.md`**.
+A Windows VM goes through the same GitOps flow as an Ubuntu one (A1–A3): a spec file in
+`vms/`, a PR, a merge, your approval. What's different is the spec, the one-time golden
+image it's built from, and how you connect. Design, build history and test results are in
+**`build-windows-vm.md`**.
 
-**Add one:**
+```
+vms/<name>.yml (vm_os: windows-2022) ──► PR ──► vm-validate ──► merge
+  ──► vm-gitops plan ──► ⏸ approve "vm-build" ──► apply (~1.5 min):
+        Terraform: copy-on-write disk on the newest Windows base image, UEFI, cloud-init disk
+        first boot: Windows setup (sysprep OOBE) + cloudbase-init: hostname, WinRM HTTPS
+        baseline over WinRM: time zone, NTP, RDP, firewall, features
+```
+
+### A8.1 Before you start (once)
+
+| Check | How | If not |
+|---|---|---|
+| A Windows golden image exists | `ssh 192.168.2.6 'virsh -c qemu:///system vol-list default \| grep windows-'` lists `windows-2022-<YYYYMMDD>-base.qcow2` | build one: A8.8 (~70 min) |
+| The admin password is in GitHub | `gh secret list --env vm-build -R woodez-ansible/infra-test-setup` shows `WINDOWS_ADMIN_PASSWORD` (same for `--env vm-destroy`) | `gh secret set WINDOWS_ADMIN_PASSWORD --env vm-build -R woodez-ansible/infra-test-setup` (it prompts; never put it on the command line) |
+| The vault on the Mac (manual runs, A8.7) | `playbooks/vars/windows-vault.yml` and `.vault_pass` exist | see A8.9 |
+| There's room | `ansible-playbook playbooks/vm-list.yml`: free RAM must cover `vm_memory_mib` + 1 GiB reserve; ~10 GB pool space is plenty to start (disks are copy-on-write) | shrink the spec or free capacity |
+
+### A8.2 The spec
+
+Start from **`vms/example-windows.yml`**. It lists every setting with its default and
+limit. Copy it to `vms/<name>.yml` and set `vm_name: <name>`. The example files
+themselves are never built.
+
 ```yaml
 # vms/win02.yml
-vm_name: win02                 # at most 15 characters (Windows computer-name limit)
+vm_name: win02                      # = file name; at most 15 characters
 vm_os: windows-2022
+vm_vcpus: 2
+vm_memory_mib: 4096                 # min 2048
+vm_disk_gib: 60                     # min 40; fixed after creation
 vm_description: "IIS test"
-vm_windows_features: [Web-Server]   # optional: Windows features/roles
-# defaults: 2 vCPU, 4096 MiB (min 2048), 60 GiB disk (min 40)
+vm_windows_features: [Web-Server]   # optional
 ```
-Open the PR, merge, approve **vm-build** (A1a). About 1.5 minutes after approval (95 s
-for `win01`) the
-`apply-build` summary shows `VM win02 (Windows Server 2022) ready at <ip>` and the MAC.
-Linux-only settings (`vm_user`, `vm_ssh_authorized_keys`, `vm_packages`,
-`vm_ubuntu_release`, `vm_firmware`, ...) are rejected in a Windows spec.
 
-**Connect:**
+| Setting | Windows rule |
+|---|---|
+| `vm_name` | lowercase letters, digits, `-`; **at most 15 characters** (Windows computer names). Becomes the hostname (`WIN02`) |
+| `vm_os` | `windows-2022`: the newest golden image. A VM keeps the image it was built from |
+| `vm_memory_mib` / `vm_disk_gib` | defaults 4096 / 60, minimums 2048 / 40. The disk **can't be resized** later: pick generously, or add `vm_extra_disks` |
+| `vm_windows_features` | Windows features/roles by their `Get-WindowsFeature` name, e.g. `[Web-Server]`, `[RSAT-AD-Tools]` |
+| `vm_timezone` | an IANA name (default `America/Toronto`) that must be listed in `windows_timezone_ids` in `playbooks/vars/vm_defaults.yml`; add it there if missing |
+| `vm_extra_disks` | blank disks; Windows shows them **Offline / RAW**. Bring them online and format them inside Windows (Disk Management, or `Initialize-Disk` in PowerShell) |
+| Linux-only settings | `vm_ubuntu_release`, `vm_user`, `vm_ssh_authorized_keys`, `vm_passwordless_sudo`, `vm_password_login`, `vm_packages`, `vm_apt_upgrade`, `vm_firmware` are **errors** in a Windows spec (Windows is always UEFI) |
+
+### A8.3 Build a Windows VM: the exact commands
+
+From the repo root on the Mac (same guard rails as A1a). This example adds `win02`.
+
+```bash
+# 1. Up-to-date master, new branch
+git switch master && git pull --ff-only
+git switch -c vms/add-win02
+
+# 2. Write the spec and check it locally
+cp vms/example-windows.yml vms/win02.yml     # edit: vm_name: win02, size, features...
+source .venv/bin/activate
+python ci/validate_vm_spec.py vms/win02.yml   # must print "ok   vms/win02.yml"
+
+# 3. Stage only the spec, check, commit
+git add vms/win02.yml
+git status -sb          # first line "## vms/add-win02"; only vms/win02.yml staged
+git commit -m "vms: add win02"
+
+# 4. Push and open the PR
+git push -u origin vms/add-win02
+gh pr create --base master --head vms/add-win02 --title "vms: add win02" \
+  --body "Adds vms/win02.yml: Windows Server 2022, 2 vCPU, 4 GiB, 60 GiB, IIS."
+
+# 5. Wait for vm-validate, then merge with a merge commit
+gh pr checks vms/add-win02 --watch
+gh pr merge vms/add-win02 --merge --delete-branch
+
+# 6. Follow the vm-gitops run and approve "vm-build" in the browser
+RUN=$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN"          # in another terminal, or after approving
+gh run view --web "$RUN"     # Review deployments → tick vm-build → Approve and deploy
+```
+
+**Before approving**, read the plan job's summary. For a new VM it shows
+`Plan: 4 to add, 0 to change, 0 to destroy` (cloud-init disk, domain, cloud-init ISO,
+root disk; one more per extra disk). If it lists a **DESTROY** you didn't expect, reject
+(A3).
+
+**After approving**, the `apply-build` job takes about 1.5 minutes (95–99 s measured):
+
+1. Terraform creates the disk on the newest Windows base image, a UEFI firmware file
+   (`/var/lib/libvirt/images/<name>_VARS.fd`) and the cloud-init disk, then starts the VM.
+2. The playbook waits for the VM's IP (guest agent; it skips `169.254.x.x` addresses
+   Windows shows before DHCP answers).
+3. It waits for **cloudbase-init to finish** (Windows' cloud-init: hostname, WinRM HTTPS
+   listener, firewall limited to the LAN), then for port 5986.
+4. The baseline runs over WinRM: time zone, NTP (`ca.pool.ntp.org`), RDP, firewall,
+   `vm_windows_features` (rebooting only if a feature needs it).
+
+The job summary then shows `win02: VM win02 (Windows Server 2022) ready at <ip> (MAC
+52:54:00:…)`. Add a **DHCP reservation** on the router for that MAC, as for Linux VMs.
+
+### A8.4 Connect and check
+
 | How | Details |
 |---|---|
-| **RDP** | `<ip>:3389`, user **`ansible`** (local admin). Network Level Authentication on; LAN only |
-| **Ansible** | WinRM HTTPS 5986, NTLM, user `ansible`, certificate validation off (each VM has its own self-signed cert). The `apply-build` summary prints an inventory line; `vm-build.yml` shows the full set of connection settings (incl. `ansible_winrm_proxy: null`, needed on macOS) |
-| **Console** (when the network is broken) | `virsh vncdisplay <name>` on compute02, then `ssh -L 5900:127.0.0.1:59NN compute02` and a VNC viewer on `localhost:5900` |
+| **RDP** (desktop) | Microsoft's **Windows App** (Mac App Store) → Add PC → `<ip>`, user **`ansible`** + the admin password. Accept the certificate warning (self-signed). Network Level Authentication is on; only the LAN can connect |
+| **Ansible** | WinRM over HTTPS (5986). Inventory below |
+| **Console** (network broken, RDP down) | on compute02: `virsh -c qemu:///system vncdisplay <name>` prints `:N` (VNC port 5900+N, bound to 127.0.0.1). From the Mac: `ssh -L 5901:127.0.0.1:590N 192.168.2.6`, then a VNC viewer on `localhost:5901` |
 
-**What the baseline sets:** time zone from `vm_timezone` (mapped to a Windows ID in
-`windows_timezone_ids`, `vm_defaults.yml`; add a zone there if yours is missing), NTP to
-`ca.pool.ntp.org`, RDP and WinRM limited to the LAN, `vm_windows_features`. As with
-`vm_packages` (A2), **changing `vm_windows_features` or `vm_timezone` alone isn't applied
-by GitOps**; use the manual fallback (A4) for it.
+An inventory for Windows VMs (all of these settings are needed; `vm-build.yml` uses the
+same ones):
 
-**The admin password** is the same on every Windows VM and **never changes** (decided
-2026-11-20). It lives in the golden image, `playbooks/vars/windows-vault.yml` (encrypted)
-and the `WINDOWS_ADMIN_PASSWORD` secret of the `vm-build`/`vm-destroy` environments. It's
-never in a spec, Terraform, cloud-init data or logs. Never print it to debug.
+```yaml
+# e.g. ~/win.yml (keep it out of the repo, or add it to inventory/ without secrets)
+windows:
+  hosts:
+    win02: { ansible_host: 192.168.2.127 }
+  vars:
+    ansible_connection: winrm
+    ansible_port: 5986
+    ansible_winrm_scheme: https
+    ansible_winrm_transport: ntlm
+    ansible_winrm_server_cert_validation: ignore   # each VM has its own self-signed cert
+    ansible_winrm_proxy: null       # macOS: avoids a crash in Ansible's forked workers
+    ansible_become: false           # the repo's ansible.cfg defaults to sudo
+    ansible_user: ansible
+    ansible_password: "{{ vault_windows_admin_password }}"
+```
 
-**Golden image (monthly, after Patch Tuesday):**
+```bash
+ansible -i ~/win.yml windows -m ansible.windows.win_ping -e @playbooks/vars/windows-vault.yml
+# win02 | SUCCESS => {"changed": false, "ping": "pong"}
+```
+
+### A8.5 Change a Windows VM
+
+As for Linux (A2): edit the spec in a PR, merge, approve.
+
+| Change | Effect |
+|---|---|
+| `vm_vcpus`, `vm_memory_mib`, `vm_description`, `vm_autostart`, adding `vm_extra_disks` | the VM **restarts** (clean shutdown, forced after 30 s). Needs `vm_allow_restart: true` |
+| `vm_disk_gib` | **refused** at plan time: disks can't be resized. Add a disk instead |
+| `vm_mac` | the VM is **rebuilt**, its disk lost. Needs `vm_allow_replace: true` |
+| `vm_windows_features`, `vm_timezone` | **not applied by GitOps on their own** (the plan says "No changes"). Apply them from the Mac with the manual command in A8.7, then commit the spec |
+| `vm_os` / a newer golden image | **no effect** on an existing VM: it keeps its image. To move it, tear it down (A8.6) and build it again (A8.3) |
+
+### A8.6 Tear down a Windows VM: the exact commands
+
+Deleting the spec is the teardown. This example removes `win02`.
+
+```bash
+git switch master && git pull --ff-only
+git switch -c vms/remove-win02
+git rm vms/win02.yml
+git status -sb          # on vms/remove-win02; only "D  vms/win02.yml" staged
+git commit -m "vms: remove win02"
+git push -u origin vms/remove-win02
+gh pr create --base master --head vms/remove-win02 --title "vms: remove win02" \
+  --body "Removes win02; its disk is deleted."
+gh pr checks vms/remove-win02 --watch
+gh pr merge vms/remove-win02 --merge --delete-branch
+
+RUN=$(gh run list --workflow vm-gitops.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run view --web "$RUN"     # Review deployments → tick vm-destroy → Approve and deploy
+gh run watch "$RUN"
+```
+
+**Before approving**, the plan summary must read `win02: DESTROY (its spec was removed)`
+and list only that VM:
+
+```
+DESTROY win02 (IP 192.168.2.127), about 4096 MiB RAM.
+These resources and their data will be permanently deleted:
+  - libvirt_cloudinit_disk.init
+  - libvirt_domain.vm
+  - libvirt_volume.cloudinit
+  - libvirt_volume.root
+Base images and other VMs are not touched.
+```
+
+**Deleted:** the VM, its disk(s), its cloud-init ISO, its UEFI firmware file
+(`<name>_VARS.fd`) and its Terraform workspace. **Kept:** the Windows golden image and every
+other VM. Nothing inside the VM is saved first: copy data off before you merge.
+
+**Check it's gone:**
+```bash
+ssh 192.168.2.6 'virsh -c qemu:///system list --all --name; ls /opt/vm-builder/vm/terraform.tfstate.d/'
+# win02 is in neither list
+```
+Also remove its DHCP reservation on the router.
+
+### A8.7 Without GitHub (manual fallback from the Mac)
+
+The same playbooks, run directly; you are the approval. Needs the repo's `.venv` (with
+`pywinrm`, in `requirements.txt`) and the vault (`.vault_pass`): the Windows baseline
+reads the password from `playbooks/vars/windows-vault.yml` when it isn't in the
+environment.
+
 ```bash
 source .venv/bin/activate
-ansible-playbook playbooks/windows-image.yml      # ~70 min on compute02; needs the vault
+ansible-playbook playbooks/vm-build.yml -e @vms/win02.yml                   # build or update + baseline
+ansible-playbook playbooks/vm-build.yml -e @vms/win02.yml -e vm_phase=plan  # plan only
+ansible-playbook playbooks/vm-destroy.yml -e vm_name=win02 -e confirm=yes   # tear down
 ```
-It adds a new base volume `windows-2022-<YYYYMMDD>-base.qcow2`. **New** VMs use the newest
-one; existing VMs keep theirs (rebuild a VM to move it: delete its spec, approve the
-destroy, add it back). Each base volume is about 8 GB; old ones stay until removed by hand.
 
-**Licence:** the images use the Server 2022 **Evaluation**: 180 days per VM, lab use only.
-When a VM nears expiry, rebuild it.
+**Commit the spec (or delete it) to match.** A VM built by hand without a spec on
+`master` gets a **destroy** queued by the next vm-gitops run (A3). It still waits for your
+approval, but don't approve it unless you mean it.
 
-**Windows troubleshooting:**
+### A8.8 The golden image
+
+Every Windows VM is a copy-on-write disk on a **golden image**: Windows Server 2022
+installed, fully patched, with VirtIO drivers, the QEMU guest agent and cloudbase-init,
+then generalized with sysprep. It's built on compute02 with Packer.
+
+```bash
+source .venv/bin/activate
+ansible-playbook playbooks/windows-image.yml      # ~70 min; needs the vault
+```
+
+- It adds `windows-2022-<YYYYMMDD>-base.qcow2` (~8 GB) to the pool. **New** VMs use the
+  newest; existing VMs keep theirs. Re-running on the same day only reloads that image.
+- **Refresh monthly**, after Patch Tuesday, so new VMs start patched.
+- List them: `ssh 192.168.2.6 'virsh -c qemu:///system vol-list default | grep windows-'`.
+- Old images stay until removed by hand. Removal isn't scripted: it's a Terraform state
+  operation in `/opt/vm-builder/images`, and safe only when no VM's disk is backed by that
+  image. Ask before doing it.
+- Build files and `packer.log`: `/var/lib/libvirt/images/.vm-builder-packer/windows-2022-<date>/`.
+
+### A8.9 Password and licence
+
+- **Password:** one local admin, **`ansible`**, with the same password on every Windows VM.
+  It **never changes** (decided 2026-11-20). It's stored in three places: the golden image,
+  `playbooks/vars/windows-vault.yml` (Ansible Vault, key `vault_windows_admin_password`),
+  and the `WINDOWS_ADMIN_PASSWORD` secret of the `vm-build` and `vm-destroy` environments
+  (only approved jobs get it). It's never in a spec, Terraform, cloud-init data or a log;
+  don't print it to debug.
+- **Licence:** the images are the Server 2022 **Evaluation**: 180 days per VM, lab use
+  only. When a VM nears expiry, tear it down and build it again (A8.6, A8.3).
+
+### A8.10 Windows troubleshooting
+
 | Symptom | Cause and fix |
 |---|---|
-| Baseline fails: "WINDOWS_ADMIN_PASSWORD is empty" | The `vm-build` environment secret is missing: `gh secret set WINDOWS_ADMIN_PASSWORD --env vm-build -R woodez-ansible/infra-test-setup` (it prompts) |
-| On the Mac: "A worker was found in a dead state" | macOS fork-safety crash in the proxy lookup. `vm-build.yml` sets `ansible_winrm_proxy: null`; set it too in any inventory of your own that uses WinRM |
-| Apply waits long at "Wait for cloudbase-init to finish" | First boot runs sysprep's OOBE and cloudbase-init (normally ~1 min). Look at the console (VNC, above) |
-| WinRM 401 from `curl --ntlm` | WinRM only offers `Negotiate`; curl's NTLM can't log in. Use Ansible or pywinrm (in `requirements.txt`) |
-| "No windows-2022 base image yet" | Run `playbooks/windows-image.yml` first |
-| Golden image build stuck or failing | `packer.log` in `/var/lib/libvirt/images/.vm-builder-packer/<build>/`; the known traps and their fixes are in `build-windows-vm.md` §4 |
+| `vm-validate` fails: "vm_name: Windows names are at most 15 characters" / "Linux only; remove it from a Windows spec" | Shorten the name / remove the Linux setting (A8.2) |
+| Plan job fails: "No windows-2022 base image yet" | Build the golden image first (A8.8) |
+| Plan job fails: "Not enough RAM" | A Windows VM needs `vm_memory_mib` + 1 GiB free on compute02; check `vm-list.yml` |
+| Baseline fails: "WINDOWS_ADMIN_PASSWORD is empty" | The `vm-build` environment secret is missing (A8.1) |
+| Baseline fails: "Need … a Windows time zone for vm_timezone" | Add the zone to `windows_timezone_ids` in `playbooks/vars/vm_defaults.yml` |
+| Apply waits long at "Wait for cloudbase-init to finish" | First boot normally takes ~1 min. Look at the console (A8.4) |
+| On the Mac: "A worker was found in a dead state" | Your inventory lacks `ansible_winrm_proxy: null` (A8.4) |
+| `ansible … win_ping` fails: "Become plugin sudo is not supported" | Add `ansible_become: false` (A8.4) |
+| WinRM 401 with `curl --ntlm` | WinRM only offers `Negotiate`, which curl's NTLM can't do. Use Ansible or pywinrm |
+| A **destroy** you didn't expect in vm-gitops | A VM was built by hand without a spec on `master`. **Reject** it, then commit its spec (A8.7) |
+| Extra disk not visible in Explorer | Expected: new disks are Offline/RAW. Online + format them in Windows (A8.2) |
+| Golden image build stuck or failing | `packer.log` (A8.8); the known traps and fixes are in `build-windows-vm.md` §4 |
 
 ---
 
