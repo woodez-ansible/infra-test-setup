@@ -443,18 +443,25 @@
         validate: visudo -cf %s
 
     # ---------- Ansible for CI jobs ----------
-    - name: Create the CI Ansible venv
+    - name: Create the CI Ansible venv (pywinrm for Windows VMs, as in requirements.txt)
       ansible.builtin.pip:
-        name: "ansible-core=={{ gha_runner_ansible_core }}"
+        name:
+          - "ansible-core=={{ gha_runner_ansible_core }}"
+          - pywinrm==0.5.0
         virtualenv: "{{ gha_runner_venv }}"
         virtualenv_command: python3 -m venv
 
+    # vm-build.yml uses ansible.windows modules: without the collection the whole
+    # playbook fails to load, Linux builds included
     - name: Install collections the playbooks use
       ansible.builtin.command: >-
         {{ gha_runner_venv }}/bin/ansible-galaxy collection install
-        'community.general:>=13.0.0,<14.0.0' -p {{ vm_builder_dir }}/collections
+        '{{ item.spec }}' -p {{ vm_builder_dir }}/collections
       args:
-        creates: "{{ vm_builder_dir }}/collections/ansible_collections/community/general"
+        creates: "{{ vm_builder_dir }}/collections/ansible_collections/{{ item.path }}"
+      loop:
+        - { spec: "community.general:>=13.0.0,<14.0.0", path: community/general }
+        - { spec: "ansible.windows:>=3.9.0,<4.0.0", path: ansible/windows }
 
     - name: Make the venv and collections readable by {{ vm_builder_group }}
       ansible.builtin.file:

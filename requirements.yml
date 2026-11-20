@@ -8,3 +8,5 @@ collections:
     version: ">=6.6.0,<7.0.0"
   - name: ansible.posix
     version: ">=2.2.0,<3.0.0"
+  - name: ansible.windows
+    version: ">=3.9.0,<4.0.0"
