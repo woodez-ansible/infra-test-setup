@@ -67,7 +67,8 @@ jobs:
 
           specs=()
           for f in vms/*.yml; do
-            n=$(basename "$f" .yml); [ "$n" = example ] && continue
+            n=$(basename "$f" .yml)
+            case "$n" in example|example-*) continue ;; esac   # reference specs, never built
             specs+=("$n")
             echo "::group::plan $n"
             "$AP" playbooks/vm-build.yml -e "@$f" -e vm_phase=plan
