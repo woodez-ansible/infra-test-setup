@@ -286,7 +286,7 @@ build time.
 | **W2** | `terraform/vm` OS switch, cloudbase-init template, UEFI/NVRAM/VNC; validator + defaults | `win01` built **by hand** (`vm-build.yml`) gets a guest-agent IP, has 5986 open, and accepts a WinRM login as `ansible` from the Mac; **the password appears in no plan file, state or log** (grep-checked) |
 | **W3** | `baseline_windows` (timezone, NTP, firewall, features, marker) + `pywinrm` in venvs (password re-set dropped: it can't work, see §9) | baseline reports Server 2022, correct timezone, NTP synced, features installed; re-run `changed=0` |
 | **W4** | GitOps: `WINDOWS_ADMIN_PASSWORD` environment secret + `ansible.windows` on the runner; end-to-end via PR | add `vms/win01.yml` → approve → built; edit → restart guard works; delete → approve → destroyed; base image untouched; the plan job has no access to the secret |
-| **W5** | docs: Windows sections in build-vm.md (Part A) | how-to covers add/rebuild/refresh image/troubleshooting |
+| **W5** | docs: Windows sections in build-vm.md (Part A); `windows-rotate-password.yml` (previous password from a second vault key, sets the new one on every Windows VM) | how-to covers add/rebuild/refresh image/rotate password/troubleshooting; a rotation on win01 works and a re-run with the new password connects |
 
 ## 9. Risks and open points
 
@@ -304,9 +304,9 @@ build time.
 - **Server certificate validation is off** (see §6). It's encrypted and LAN-only, but not
   pinned.
 - **Shared admin password** across all Windows VMs (your choice). Keep it strong.
-- **Password rotation (open, decide before W5):** re-running builds does **not** rotate it
-  (see "Where the password lives"). Options:
-  1. *(recommended)* a `windows-rotate-password.yml` that connects to each Windows VM with
+- **Password rotation: option 1 chosen (2026-11-20), built in W5.** Re-running builds
+  does **not** rotate it (see "Where the password lives"). Options considered:
+  1. **(chosen)** a `windows-rotate-password.yml` that connects to each Windows VM with
      the **previous** password (a second vault key, used only for this), sets the new one,
      then you rebuild the golden image so new VMs get it too
   2. set it through the guest agent (no login needed). Simpler, but the new password
