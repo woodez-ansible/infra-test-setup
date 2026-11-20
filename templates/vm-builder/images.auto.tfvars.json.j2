@@ -5,4 +5,8 @@
         'build': img.build,
         'path': tf_cache_dir ~ '/ubuntu-' ~ release ~ '-' ~ img.build ~ '.img'}}) -%}
 {%- endfor -%}
+{#- Completed Windows golden images (playbooks/tasks/windows-builds.yml) -#}
+{%- for w in windows_builds | default([]) -%}
+{%-   set _ = images.update({w.key: {'build': w.build, 'path': w.path}}) -%}
+{%- endfor -%}
 {{ {'libvirt_uri': libvirt_uri, 'pool': libvirt_pool, 'images': images} | to_nice_json }}

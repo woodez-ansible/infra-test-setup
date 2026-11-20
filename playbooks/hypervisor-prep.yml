@@ -102,7 +102,98 @@
       loop: "{{ ubuntu_images | dict2items }}"
       loop_control: { label: "{{ item.key }} ({{ item.value.build }})" }
 
+    # ---------- Windows golden image prerequisites (build-windows-vm.md W1) ----------
+    - name: Install Packer, archive/WIM tools and libguestfs (offline image checks)
+      ansible.builtin.apt:
+        name:
+          - "packer={{ packer_version }}-*"
+          - libarchive-tools
+          - wimtools
+          - libguestfs-tools
+        state: present
+        update_cache: true
+        allow_change_held_packages: true
+
+    - name: Hold Packer at {{ packer_version }}
+      ansible.builtin.dpkg_selections:
+        name: packer
+        selection: hold
+
+    - name: Create Windows build directories (on the pool's filesystem; root is small)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: "{{ vm_builder_group }}"
+        mode: "2775"
+      loop:
+        - "{{ win_cache_dir }}"
+        - "{{ win_packer_dir }}"
+        - "{{ packer_plugin_dir }}"
+
+    - name: Install the Packer qemu plugin {{ packer_qemu_plugin_version }}
+      ansible.builtin.command: >-
+        packer plugins install github.com/hashicorp/qemu v{{ packer_qemu_plugin_version }}
+      environment:
+        PACKER_PLUGIN_PATH: "{{ packer_plugin_dir }}"
+      args:
+        creates: "{{ packer_plugin_dir }}/github.com/hashicorp/qemu/packer-plugin-qemu_v{{ packer_qemu_plugin_version }}_x5.0_linux_amd64"
+
+    - name: Make Packer plugins readable by {{ vm_builder_group }}
+      ansible.builtin.file:
+        path: "{{ packer_plugin_dir }}"
+        group: "{{ vm_builder_group }}"
+        mode: g+rX
+        recurse: true
+
+    - name: Download the Windows Server 2022 evaluation ISO (SHA-256 verified)
+      ansible.builtin.get_url:
+        url: "{{ windows_2022.iso_url }}"
+        dest: "{{ win_cache_dir }}/{{ windows_2022.iso_file }}"
+        checksum: "sha256:{{ windows_2022.iso_sha256 }}"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+        timeout: 1800
+
+    - name: Download the virtio-win RPM (MD5 published by Fedora)
+      ansible.builtin.get_url:
+        url: "{{ virtio_win.rpm_url }}"
+        dest: "{{ win_cache_dir }}/virtio-win-{{ virtio_win.version }}.noarch.rpm"
+        checksum: "md5:{{ virtio_win.rpm_md5 }}"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+
+    - name: Extract the virtio-win ISO from the verified RPM
+      ansible.builtin.shell: |
+        set -euo pipefail
+        t=$(mktemp -d -p {{ win_cache_dir }} .virtio.XXXX)
+        bsdtar -xf {{ win_cache_dir }}/virtio-win-{{ virtio_win.version }}.noarch.rpm -C "$t"
+        cp "$t/usr/share/virtio-win/{{ virtio_win.iso_file }}" {{ win_cache_dir }}/{{ virtio_win.iso_file }}
+        rm -rf "$t"
+        echo "{{ virtio_win.iso_sha256 }}  {{ win_cache_dir }}/{{ virtio_win.iso_file }}" | sha256sum -c -
+      args:
+        executable: /bin/bash
+        creates: "{{ win_cache_dir }}/{{ virtio_win.iso_file }}"
+
+    - name: Verify the virtio-win ISO checksum
+      ansible.builtin.stat:
+        path: "{{ win_cache_dir }}/{{ virtio_win.iso_file }}"
+        checksum_algorithm: sha256
+      register: virtio_iso
+      failed_when: virtio_iso.stat.checksum != virtio_win.iso_sha256
+
+    - name: Download cloudbase-init {{ cloudbase_init.version }} (SHA-256 from its GitHub release)
+      ansible.builtin.get_url:
+        url: "{{ cloudbase_init.msi_url }}"
+        dest: "{{ win_cache_dir }}/{{ cloudbase_init.msi_file }}"
+        checksum: "sha256:{{ cloudbase_init.msi_sha256 }}"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+
     # ---------- terraform/images ----------
+    - name: Find completed Windows golden images (they're base volumes too)
+      ansible.builtin.include_tasks: tasks/windows-builds.yml
+
     - name: Copy terraform/images code
       ansible.builtin.copy:
         src: "{{ item }}"

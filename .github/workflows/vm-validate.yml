@@ -77,3 +77,4 @@ jobs:
           ansible-playbook --syntax-check playbooks/vm-list.yml
           ansible-playbook --syntax-check playbooks/vm-build.yml -e vm_name=syntax-check
           ansible-playbook --syntax-check playbooks/vm-destroy.yml -e vm_name=syntax-check -e confirm=yes
+          ansible-playbook --syntax-check playbooks/windows-image.yml

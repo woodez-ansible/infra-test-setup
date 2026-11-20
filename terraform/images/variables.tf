@@ -20,7 +20,9 @@ variable "images" {
   }))
 
   validation {
-    condition     = alltrue([for k, v in var.images : can(regex("^[0-9]{2}\\.[0-9]{2}$", k)) && can(regex("^[0-9]{8}$", v.build))])
-    error_message = "Keys must be releases like \"26.04\" and build must be a YYYYMMDD date."
+    condition = alltrue([for k, v in var.images :
+      can(regex("^([0-9]{2}\\.[0-9]{2}|windows-[0-9]{4}-[0-9]{8})$", k)) && can(regex("^[0-9]{8}$", v.build))
+    ])
+    error_message = "Keys must be Ubuntu releases like \"26.04\" or Windows builds like \"windows-2022-20261120\"; build must be a YYYYMMDD date."
   }
 }

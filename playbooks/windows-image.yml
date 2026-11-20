@@ -1,0 +1,239 @@
+---
+# Build the Windows Server 2022 golden image with Packer on the hypervisor and load it
+# into the libvirt pool as base volume windows-2022-<YYYYMMDD>-base.qcow2.
+#   ansible-playbook playbooks/windows-image.yml            (from the Mac; needs the vault)
+# Takes ~1-2 hours (mostly Windows Update). Re-running on a day that already has a
+# completed build only (re)loads the base volume. Run hypervisor-prep.yml first.
+- name: Build the Windows Server 2022 golden image
+  hosts: hypervisors
+  become: false
+  gather_facts: false
+
+  vars:
+    key: "windows-2022-{{ build_date }}"   # build_date is fixed once in pre_tasks
+    build_dir: "{{ win_packer_dir }}/{{ key }}"
+    cd_dir: "{{ build_dir }}/cd"
+    template_dir: "{{ build_dir }}/template"
+    repo_root: "{{ inventory_dir }}/.."
+    tf_images_dir: "{{ vm_builder_dir }}/images"
+    tf_env:
+      TF_PLUGIN_CACHE_DIR: "{{ vm_builder_dir }}/.plugin-cache"
+      TF_IN_AUTOMATION: "1"
+    packer_env:
+      PACKER_PLUGIN_PATH: "{{ packer_plugin_dir }}"
+      PACKER_LOG: "1"
+      PACKER_LOG_PATH: "{{ build_dir }}/packer.log"
+      TMPDIR: "{{ build_dir }}/tmp"      # Packer's temp files (incl. the answer-file CD) stay on the big filesystem
+
+  pre_tasks:
+    # Fixed once: a lazy lookup would change the key if the build runs past midnight
+    - name: Fix the build date
+      ansible.builtin.set_fact:
+        build_date: "{{ lookup('ansible.builtin.pipe', 'date +%Y%m%d') }}"
+
+    - name: Load the Windows admin password from the vault
+      ansible.builtin.include_vars:
+        file: vars/windows-vault.yml
+      no_log: true
+
+    - name: Require the password
+      ansible.builtin.assert:
+        that: vault_windows_admin_password | default('') | length >= 8
+        fail_msg: "Set vault_windows_admin_password in playbooks/vars/windows-vault.yml (ansible-vault create)."
+        quiet: true
+      no_log: true
+
+  tasks:
+    - name: Check for a completed build today
+      ansible.builtin.stat:
+        path: "{{ build_dir }}/{{ key }}.complete"
+      register: done_marker
+
+    - name: Build the image
+      when: not done_marker.stat.exists
+      block:
+        - name: Start from a clean build directory (a previous run today may have failed)
+          ansible.builtin.file:
+            path: "{{ build_dir }}"
+            state: absent
+
+        - name: Create build directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "2775"
+            group: "{{ vm_builder_group }}"
+          loop:
+            - "{{ build_dir }}"
+            - "{{ build_dir }}/tmp"
+            - "{{ cd_dir }}/drivers"
+            - "{{ cd_dir }}/scripts"
+            - "{{ cd_dir }}/cloudbase-init"
+            - "{{ template_dir }}/scripts"
+
+        # The build's second CD: only what setup and the provisioners need
+        # xorriso, not bsdtar: the ISO stores these files as hard links to amd64/w10/...,
+        # which bsdtar can't resolve when extracting only part of the ISO
+        - name: Stage VirtIO drivers (Server 2022, amd64) and guest tools from the virtio-win ISO
+          ansible.builtin.shell: |
+            set -euo pipefail
+            iso={{ win_cache_dir }}/{{ virtio_win.iso_file }}
+            xorriso -osirrox on -indev "$iso" \
+              -extract /viostor/2k22/amd64 {{ cd_dir }}/drivers/viostor \
+              -extract /vioscsi/2k22/amd64 {{ cd_dir }}/drivers/vioscsi \
+              -extract /NetKVM/2k22/amd64  {{ cd_dir }}/drivers/NetKVM \
+              -extract /Balloon/2k22/amd64 {{ cd_dir }}/drivers/Balloon \
+              -extract /virtio-win-guest-tools.exe {{ cd_dir }}/virtio-win-guest-tools.exe \
+              >/dev/null 2>&1
+            chmod -R u+w {{ cd_dir }}   # ISO files are read-only; cleanup needs to delete them
+            for d in viostor vioscsi NetKVM Balloon; do ls {{ cd_dir }}/drivers/$d/*.inf >/dev/null; done
+            test -s {{ cd_dir }}/virtio-win-guest-tools.exe
+          args: { executable: /bin/bash }
+          changed_when: true
+
+        - name: Stage cloudbase-init MSI
+          ansible.builtin.copy:
+            src: "{{ win_cache_dir }}/{{ cloudbase_init.msi_file }}"
+            dest: "{{ cd_dir }}/{{ cloudbase_init.msi_file }}"
+            remote_src: true
+            mode: "0644"
+
+        - name: Stage scripts and cloudbase-init config onto the CD
+          ansible.builtin.copy:
+            src: "{{ repo_root }}/packer/windows-2022/{{ item.src }}"
+            dest: "{{ cd_dir }}/{{ item.dest }}"
+            mode: "0644"
+          loop:
+            - { src: scripts/, dest: scripts/ }
+            - { src: cloudbase-init/, dest: cloudbase-init/ }
+
+        - name: Copy the Packer template
+          ansible.builtin.copy:
+            src: "{{ repo_root }}/packer/windows-2022/"
+            dest: "{{ template_dir }}/"
+            mode: "0644"
+
+        - name: Packer init (plugin is already installed by hypervisor-prep.yml)
+          ansible.builtin.command: packer init {{ template_dir }}
+          environment: "{{ packer_env }}"
+          changed_when: false
+
+        - name: Packer build (1-2 hours; the admin password is passed only via PKR_VAR_admin_password)
+          ansible.builtin.command:
+            argv:
+              - packer
+              - build
+              - -color=false
+              - -var=iso_path={{ win_cache_dir }}/{{ windows_2022.iso_file }}
+              - -var=iso_sha256={{ windows_2022.iso_sha256 }}
+              - -var=image_name={{ windows_2022.image_name }}
+              - -var=cd_dir={{ cd_dir }}
+              - -var=output_dir={{ build_dir }}/output
+              - -var=vm_name={{ key }}.qcow2
+              - "{{ template_dir }}"
+          environment: "{{ packer_env | combine({'PKR_VAR_admin_password': vault_windows_admin_password}) }}"
+          async: 14400        # 4 h ceiling
+          poll: 60
+          register: packer_build
+          changed_when: true
+          no_log: true        # the environment holds the password
+
+        - name: Report the Packer result (log is on the hypervisor; password redacted by Packer)
+          ansible.builtin.debug:
+            msg: "packer exit {{ packer_build.rc | default('?') }}; log: {{ build_dir }}/packer.log"
+
+        - name: Fail if Packer failed
+          ansible.builtin.fail:
+            msg: "Packer build failed (exit {{ packer_build.rc | default('?') }}). See {{ build_dir }}/packer.log on {{ inventory_hostname }}."
+          when: packer_build.rc | default(1) != 0
+
+        - name: Move the image into place
+          ansible.builtin.command: mv {{ build_dir }}/output/{{ key }}.qcow2 {{ build_dir }}/{{ key }}.qcow2
+          args:
+            creates: "{{ build_dir }}/{{ key }}.qcow2"
+
+        # Offline check: Windows must be generalized for OOBE (sysprep finished), and the
+        # build-only WinRM HTTP access must be gone.
+        - name: Check the image is sysprepped (offline, read-only)
+          ansible.builtin.shell: |
+            set -uo pipefail
+            img={{ build_dir }}/{{ key }}.qcow2
+            echo "state=$(virt-cat -a "$img" /Windows/Setup/State/State.ini 2>/dev/null | tr -d '\r' | awk -F= '/ImageState/{print $2}')"
+            echo "cloudbase_conf=$(virt-cat -a "$img" '/Program Files/Cloudbase Solutions/Cloudbase-Init/conf/cloudbase-init.conf' 2>/dev/null | grep -c NoCloudConfigDriveService)"
+            echo "finalize_log=$(virt-cat -a "$img" /Windows/Temp/vmb-finalize.log 2>/dev/null | grep -c Sysprep || true)"
+          args: { executable: /bin/bash }
+          become: true   # libguestfs reads /boot/vmlinuz-*, which Ubuntu keeps root-only (0600)
+          environment:
+            LIBGUESTFS_BACKEND: direct
+          register: image_check
+          changed_when: false
+          failed_when: >-
+            'state=IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE' not in image_check.stdout
+            or 'cloudbase_conf=1' not in image_check.stdout
+
+        - name: Clean up the build's CD staging, temp files and Packer output directory
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ cd_dir }}"
+            - "{{ build_dir }}/tmp"
+            - "{{ build_dir }}/output"
+
+        - name: Mark the build complete (only now does it become a base image)
+          ansible.builtin.copy:
+            dest: "{{ build_dir }}/{{ key }}.complete"
+            content: "{{ image_check.stdout }}\n"
+            mode: "0644"
+
+    # ---------- Load into the pool through terraform/images ----------
+    - name: Find completed Windows golden images
+      ansible.builtin.include_tasks: tasks/windows-builds.yml
+
+    - name: Write image variables file
+      ansible.builtin.template:
+        src: "{{ repo_root }}/templates/vm-builder/images.auto.tfvars.json.j2"
+        dest: "{{ tf_images_dir }}/images.auto.tfvars.json"
+        group: "{{ vm_builder_group }}"
+        mode: "0664"
+      vars:
+        tf_cache_dir: "{{ vm_builder_dir }}/cache"
+
+    - name: Terraform plan (images)
+      ansible.builtin.shell: |
+        set -uo pipefail
+        umask 0002
+        terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+      args: { chdir: "{{ tf_images_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      register: tf_plan
+      changed_when: false
+      failed_when: tf_plan.rc not in [0, 2]
+
+    - name: Refuse anything but adding base volumes
+      ansible.builtin.assert:
+        that: tf_plan.stdout is not search('to destroy') or tf_plan.stdout is search('0 to destroy')
+        fail_msg: "Unexpected plan: base volumes would be destroyed. Nothing applied.\n{{ tf_plan.stdout }}"
+        quiet: true
+      when: tf_plan.rc == 2
+
+    - name: Terraform apply (adds windows-2022-<date>-base.qcow2)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 0002
+        terraform apply -input=false -no-color tfplan
+      args: { chdir: "{{ tf_images_dir }}", executable: /bin/bash }
+      environment: "{{ tf_env }}"
+      when: tf_plan.rc == 2
+      changed_when: true
+
+    - name: Show Windows base volumes in the pool
+      ansible.builtin.shell: virsh -c {{ libvirt_uri }} vol-list {{ libvirt_pool }} | awk '/windows-/{print $1}'
+      register: win_vols
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Windows base volumes: {{ win_vols.stdout_lines }}"
+          - "This build: {{ key }}-base.qcow2"

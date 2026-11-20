@@ -1,0 +1,23 @@
+---
+# Find completed Windows golden images on the hypervisor and expose them as
+# `windows_builds` for templates/vm-builder/images.auto.tfvars.json.j2.
+# Layout: {{ win_packer_dir }}/<key>/<key>.qcow2 plus <key>.complete, where
+# <key> = windows-2022-YYYYMMDD. Only builds with the .complete marker count, so a
+# half-finished or failed Packer run never becomes a base image.
+- name: Find completed Windows golden images
+  ansible.builtin.find:
+    paths: "{{ win_packer_dir }}"
+    patterns: "windows-*.complete"
+    recurse: true
+    depth: 2
+  register: win_complete
+
+- name: List completed Windows builds
+  ansible.builtin.set_fact:
+    windows_builds: "{{ builds_json | from_json }}"
+  vars:
+    builds_json: >-
+      [{% for f in win_complete.files | map(attribute='path') | sort %}
+      {%- set key = f | basename | regex_replace('\.complete$', '') -%}
+      {"key": "{{ key }}", "build": "{{ key[-8:] }}", "path": "{{ f | dirname }}/{{ key }}.qcow2"}{{ ',' if not loop.last else '' }}
+      {%- endfor %}]
