@@ -342,12 +342,13 @@ vm_ubuntu_release: "26.04"   # "26.04" | "24.04"
 
 | Setting | Default | Notes |
 |---|---|---|
-| `vm_name` | **required** | lowercase letters, digits and `-`; becomes the hostname and the domain name |
+| `vm_name` | **required** | lowercase letters, digits and `-`; becomes the hostname and the domain name. Windows: **at most 15** characters (NetBIOS limit) |
+| `vm_os` | `ubuntu` | or `windows-2022`: Windows Server 2022 from the newest golden image (`build-windows-vm.md`). Linux-only settings below are rejected on Windows specs |
 | `vm_vcpus` | `2` | checked against free host CPUs (warning only; CPUs can be shared) |
-| `vm_memory_mib` | `2048` | **hard check**: must fit in available host RAM minus a 1 GiB reserve |
-| `vm_disk_gib` | `20` | root disk; it grows the base image, which is about 3.5 GB. **Fixed after creation** (the provider can't resize volumes); use `vm_extra_disks` for more |
+| `vm_memory_mib` | `2048` (Windows `4096`, min 2048) | **hard check**: must fit in available host RAM minus a 1 GiB reserve |
+| `vm_disk_gib` | `20` (Windows `60`, min 40) | root disk; it grows the base image, which is about 3.5 GB. **Fixed after creation** (the provider can't resize volumes); use `vm_extra_disks` for more |
 | `vm_extra_disks` | `[]` | e.g. `[{size_gib: 20}]`; blank qcow2 disks, left unformatted |
-| `vm_ubuntu_release` | `"26.04"` | selects the base image |
+| `vm_ubuntu_release` | `"26.04"` | selects the base image. Only for new VMs: an existing VM stays on the base it was built from (destroy and build to move it) |
 | `vm_bridge` | `br0` | |
 | `vm_mac` | derived from the name | a stable MAC per name, so a **DHCP reservation on the router** can give the VM a fixed IP; set it explicitly to override |
 | `vm_user` | `kwood` | created by cloud-init |
@@ -357,12 +358,13 @@ vm_ubuntu_release: "26.04"   # "26.04" | "24.04"
 | `vm_timezone` | `America/Toronto` | baseline applies chrony with `ca.pool.ntp.org`, as on db01 and the k8s nodes |
 | `vm_packages` | `[]` | extra apt packages installed by the baseline |
 | `vm_apt_upgrade` | `true` | full upgrade on first build |
+| `vm_windows_features` | `[]` | Windows only: features/roles for the baseline to install, e.g. `[Web-Server]` |
 | `vm_autostart` | `true` | start when compute02 boots |
-| `vm_firmware` | `bios` | or `uefi` (OVMF is installed) |
+| `vm_firmware` | `bios` | or `uefi` (OVMF, NVRAM file in the pool). Windows is always UEFI |
 | `vm_cpu_mode` | `host-passthrough` | best performance; use `host-model` if you might move VMs between hosts |
 | `vm_description` | `""` | stored as the libvirt domain title |
 | `vm_allow_restart` | `false` | set `true` in the spec to let a vCPU/RAM change restart the VM |
-| `vm_allow_replace` | `false` | set `true` to let a release or MAC change rebuild the VM; **its disk is lost** |
+| `vm_allow_replace` | `false` | set `true` to let a change such as a new MAC rebuild the VM; **its disk is lost** |
 
 Settings are validated before anything is built: types, ranges, name format, and a
 check that the name isn't already a libvirt domain or a Terraform workspace.

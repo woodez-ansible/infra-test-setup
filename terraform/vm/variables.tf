@@ -9,11 +9,24 @@ variable "pool" {
   type = string
 }
 
+variable "os" {
+  description = "Guest OS family: ubuntu (cloud-init) or windows (cloudbase-init, UEFI)."
+  type        = string
+  validation {
+    condition     = contains(["ubuntu", "windows"], var.os)
+    error_message = "os must be ubuntu or windows."
+  }
+}
+
 variable "name" {
   type = string
   validation {
     condition     = can(regex("^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$", var.name))
     error_message = "name: lowercase letters, digits and '-', 1-32 chars, starting with a letter."
+  }
+  validation {
+    condition     = var.os != "windows" || length(var.name) <= 15
+    error_message = "Windows VM names are at most 15 characters (NetBIOS computer name limit)."
   }
 }
 
@@ -87,7 +100,7 @@ variable "autostart" {
   type = bool
 }
 
-# ---------- cloud-init ----------
+# ---------- cloud-init (Linux only; ignored for Windows) ----------
 variable "user" {
   type = string
 }
@@ -95,7 +108,7 @@ variable "user" {
 variable "ssh_authorized_keys" {
   type = list(string)
   validation {
-    condition     = length(var.ssh_authorized_keys) > 0
+    condition     = var.os == "windows" || length(var.ssh_authorized_keys) > 0
     error_message = "At least one SSH public key is required (password login is off by default)."
   }
 }

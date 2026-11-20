@@ -24,10 +24,19 @@ MAC_RE = re.compile(r"^52:54:00(:[0-9a-f]{2}){3}$")
 RANGES = {"vm_vcpus": (1, 16), "vm_memory_mib": (512, 16384), "vm_disk_gib": (5, 500)}
 BOOLS = {"vm_passwordless_sudo", "vm_password_login", "vm_apt_upgrade", "vm_autostart",
          "vm_allow_restart", "vm_allow_replace"}
-CHOICES = {"vm_firmware": {"bios", "uefi"}, "vm_cpu_mode": {"host-passthrough", "host-model"}}
+CHOICES = {"vm_firmware": {"bios", "uefi"}, "vm_cpu_mode": {"host-passthrough", "host-model"},
+           "vm_os": {"ubuntu", "windows-2022"}}
 STRINGS = {"vm_bridge", "vm_user", "vm_timezone", "vm_description"}
 # Settings that are host policy, not per-VM choices
 NOT_IN_SPECS = {"vm_host_memory_reserve_mib", "vm_bridge_default"}
+
+# Windows (build-windows-vm.md §5): NetBIOS name limit, minimums set by the golden image,
+# and settings that only mean something to cloud-init/apt/Linux users
+WINDOWS_MAX_NAME = 15
+WINDOWS_MIN = {"vm_memory_mib": 2048, "vm_disk_gib": 40}
+LINUX_ONLY = {"vm_ubuntu_release", "vm_user", "vm_ssh_authorized_keys", "vm_passwordless_sudo",
+              "vm_password_login", "vm_packages", "vm_apt_upgrade", "vm_firmware"}
+WINDOWS_ONLY = {"vm_windows_features"}
 
 
 def allowed_keys() -> set[str]:
@@ -82,11 +91,23 @@ def check(path: Path, keys: set[str], known_releases: set[str]) -> list[str]:
             for d in disks
         ):
             errors.append("vm_extra_disks: must be a list like [{size_gib: 20}]")
-    for key in ("vm_packages", "vm_ssh_authorized_keys"):
+    for key in ("vm_packages", "vm_ssh_authorized_keys", "vm_windows_features"):
         if key in spec and not (isinstance(spec[key], list) and all(isinstance(x, str) for x in spec[key])):
             errors.append(f"{key}: must be a list of strings")
     if spec.get("vm_passwordless_sudo") is False and not spec.get("vm_password_login", False):
         errors.append("vm_passwordless_sudo: false needs vm_password_login: true, or sudo is unusable")
+
+    if str(spec.get("vm_os", "ubuntu")).startswith("windows"):
+        if isinstance(name, str) and len(name) > WINDOWS_MAX_NAME:
+            errors.append(f"vm_name: Windows names are at most {WINDOWS_MAX_NAME} characters (NetBIOS limit)")
+        for key, low in WINDOWS_MIN.items():
+            if isinstance(spec.get(key), int) and spec[key] < low:
+                errors.append(f"{key}: Windows needs at least {low}")
+        for key in sorted(LINUX_ONLY & spec.keys()):
+            errors.append(f"{key}: Linux only; remove it from a Windows spec")
+    else:
+        for key in sorted(WINDOWS_ONLY & spec.keys()):
+            errors.append(f"{key}: Windows only (needs vm_os: windows-2022)")
     return errors
 
 

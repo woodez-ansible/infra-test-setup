@@ -207,6 +207,32 @@ vm_description: "Windows test VM"
   vault, or in CI from the `WINDOWS_ADMIN_PASSWORD` environment variable. All tasks that
   touch it use `no_log`
 
+### W2 as built (2026-11-20)
+
+- **UEFI:** explicit `OVMF_CODE_4M.fd` (no Secure Boot, as the image was built) and an
+  NVRAM file `/var/lib/libvirt/images/<name>_VARS.fd`. Provider 0.9.9 deletes it on
+  destroy (tested). UEFI also needs `<acpi/>` ("UEFI requires ACPI"), so **every** VM now
+  gets ACPI; that also lets Linux VMs shut down cleanly. Linux `vm_firmware: uefi` uses
+  the same path (it couldn't have worked before).
+- **Windows extras:** Hyper-V enlightenments (relaxed, vapic, spinlocks, vp_index, synic,
+  stimer) + `hypervclock`, and VNC on 127.0.0.1.
+- **User data** (`windows-user-data.ps1.tftpl`, no credentials): limits the 5986 firewall
+  rule to `LocalSubnet` on all profiles.
+- **Ready means cloudbase-init finished:** `vm-build.yml` waits (over the guest agent)
+  for `HKLM\SOFTWARE\Cloudbase Solutions\Cloudbase-Init\<name>\Plugins\UserDataPlugin = 1`,
+  the Windows equivalent of `cloud-init status --wait`. Waiting only for port 5986 isn't
+  enough: ConfigWinRMListener opens it, to any address, ~5 s before UserData narrows it.
+- **Base image per VM:** `terraform/vm` ignores `backing_store` changes, so a newer golden
+  image is used by new VMs only; existing VMs keep theirs (this applies to Ubuntu too).
+- **Client side:** WinRM only offers `Negotiate`, so `curl --ntlm` gets 401 without even
+  reaching a logon (no 4624/4625 events). pywinrm 0.5.0 (`transport=ntlm`) works; it's in
+  `requirements.txt`.
+- **Checked on win01:** guest-agent IP, cloudbase-init done and ready in ~75 s from
+  apply; WinRM login as `ansible` from the Mac (admin, hostname `WIN01`, HTTPS-only
+  listener, 5986 limited to `LocalSubnet`); password found **0** times in tfvars, state,
+  the cloud-init ISOs and the playbook log; re-run `changed=0`; destroy leaves no domain,
+  disk or NVRAM file; a throwaway Ubuntu VM still builds and baselines.
+
 ### WinRM server certificate
 
 cloudbase-init creates a self-signed HTTPS certificate per VM. Ansible connects with

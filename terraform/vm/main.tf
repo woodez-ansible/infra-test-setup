@@ -1,5 +1,8 @@
 locals {
-  gib = 1024 * 1024 * 1024
+  gib     = 1024 * 1024 * 1024
+  windows = var.os == "windows"
+  # Windows always boots UEFI (the golden image is GPT/UEFI)
+  uefi = local.windows || var.firmware == "uefi"
 }
 
 # ---------- Disks ----------
@@ -20,6 +23,12 @@ resource "libvirt_volume" "root" {
     format = {
       type = "qcow2"
     }
+  }
+
+  lifecycle {
+    # A VM stays on the base it was built from. A newer base image (e.g. next month's
+    # Windows build) is for new VMs; changing it here would rebuild the VM.
+    ignore_changes = [backing_store]
   }
 }
 
@@ -45,7 +54,10 @@ resource "libvirt_cloudinit_disk" "init" {
     name = var.name
   })
 
-  user_data = templatefile("${path.module}/templates/user-data.yaml.tftpl", {
+  # Windows: cloudbase-init reads the same NoCloud disk. Its user data holds no
+  # credentials (the admin account is in the golden image), and it gets no
+  # network-config: Windows uses DHCP on the virtio NIC by default.
+  user_data = local.windows ? file("${path.module}/templates/windows-user-data.ps1.tftpl") : templatefile("${path.module}/templates/user-data.yaml.tftpl", {
     name                = var.name
     user                = var.user
     ssh_authorized_keys = var.ssh_authorized_keys
@@ -54,7 +66,7 @@ resource "libvirt_cloudinit_disk" "init" {
     timezone            = var.timezone
   })
 
-  network_config = templatefile("${path.module}/templates/network-config.yaml.tftpl", {
+  network_config = local.windows ? null : templatefile("${path.module}/templates/network-config.yaml.tftpl", {
     mac = var.mac
   })
 
@@ -88,12 +100,38 @@ resource "libvirt_domain" "vm" {
   autostart   = var.autostart
   running     = true
 
+  # UEFI: explicit OVMF (no Secure Boot, as the Windows image was built) and a per-VM
+  # NVRAM file in the pool. Provider 0.9.9 deletes that file on destroy (tested).
   os = {
-    type         = "hvm"
-    type_arch    = "x86_64"
-    type_machine = "q35"
-    firmware     = var.firmware == "uefi" ? "efi" : null
+    type            = "hvm"
+    type_arch       = "x86_64"
+    type_machine    = "q35"
+    loader          = local.uefi ? "/usr/share/OVMF/OVMF_CODE_4M.fd" : null
+    loader_readonly = local.uefi ? "yes" : null
+    loader_type     = local.uefi ? "pflash" : null
+    nv_ram = local.uefi ? {
+      nv_ram   = "/var/lib/libvirt/images/${var.name}_VARS.fd"
+      template = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+    } : null
   }
+
+  # ACPI: UEFI requires it, and it's what lets a guest shut down cleanly on request.
+  # Hyper-V enlightenments make Windows run (and idle) efficiently under KVM.
+  features = {
+    acpi = true
+    hyper_v = local.windows ? {
+      relaxed   = { state = "on" }
+      vapic     = { state = "on" }
+      spinlocks = { state = "on", retries = 8191 }
+      vp_index  = { state = "on" }
+      synic     = { state = "on" }
+      stimer    = { state = "on" }
+    } : null
+  }
+
+  clock = local.windows ? {
+    timer = [{ name = "hypervclock", present = "yes" }]
+  } : null
 
   cpu = {
     mode = var.cpu_mode
@@ -133,6 +171,10 @@ resource "libvirt_domain" "vm" {
       source = { unix = { mode = "bind" } }
       target = { virt_io = { name = "org.qemu.guest_agent.0" } }
     }]
+
+    # Windows has no serial console: VNC on the hypervisor's loopback only, for
+    # emergencies (ssh -L 5900:127.0.0.1:<port> compute02; port from `virsh vncdisplay`)
+    graphics = local.windows ? [{ vnc = { listen = "127.0.0.1", auto_port = true } }] : null
 
     # `virsh console <name>` (Ubuntu cloud images log to ttyS0)
     serials = [{
