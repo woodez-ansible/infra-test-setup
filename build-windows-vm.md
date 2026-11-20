@@ -33,7 +33,7 @@ without approval. So:
 | **Golden image** | Packer creates the local admin user `ansible` (Administrators) with the vault password **before sysprep**. Local accounts survive `sysprep /generalize`, so every VM starts with it. cloudbase-init never touches users |
 | **Ansible vault** | `vault_windows_admin_password` in **`playbooks/vars/windows-vault.yml`** (encrypted, same vault password as the others). **You add it** (`ansible-vault create`); I never see the value. It's loaded **explicitly** (`include_vars`) only by `windows-image.yml` and by Windows builds run from the Mac. It must **not** go in `inventory/group_vars/hypervisors/`: the CI inventory puts compute02 in that group, so Ansible on the runner would try to decrypt it and fail every `vm-gitops` run ("no vault secrets found") |
 | **CI (runner)** | GitHub **environment secret** `WINDOWS_ADMIN_PASSWORD` on **`vm-build`** and **`vm-destroy`**. GitHub only gives environment secrets to jobs that were **approved** to run in that environment, so the no-approval `plan` job never has it. You set it with `gh secret set WINDOWS_ADMIN_PASSWORD --env vm-build -R woodez-ansible/infra-test-setup` (it prompts) |
-| **Existing VMs** | `baseline_windows` re-sets `ansible`'s password from the vault/secret on every run, so rotating it is: update the vault + secret, re-run builds |
+| **Existing VMs** | Keep the password they were built with. *Correction (W3):* the plan had the baseline re-set it on every run, but the baseline logs in **with** the vault password, so after a rotation it can't reach the old VMs at all, and before one it would only set the same value. Rotation needs a separate step that knows the old password; see "Password rotation" in §9 |
 
 Kept out of: Terraform variables and state, cloud-init/cidata, plan files, Ansible output
 (`no_log` on every task that handles it), git (vault is encrypted).
@@ -233,6 +233,30 @@ vm_description: "Windows test VM"
   the cloud-init ISOs and the playbook log; re-run `changed=0`; destroy leaves no domain,
   disk or NVRAM file; a throwaway Ubuntu VM still builds and baselines.
 
+### W3 as built (2026-11-20)
+
+- **Play "Baseline the Windows VM"** in `vm-build.yml` (hosts `new_windows_vm`), over
+  WinRM HTTPS/NTLM as `ansible`, `become: false` (`ansible.cfg` defaults to sudo):
+  - time zone from `vm_timezone` via `windows_timezone_ids` (IANA → Windows ID, in
+    `vm_defaults.yml`; unmapped zones fail with a clear message)
+  - `w32time`: `ca.pool.ntp.org` (same servers as chrony), started automatically
+  - RDP on with NLA; RDP and WinRM 5986 firewall rules limited to `LocalSubnet`
+  - `vm_windows_features` via `win_feature`, rebooting only if a feature needs it
+  - marker `HKLM\SOFTWARE\VMBuilder\BaselineDone`, then a report (OS, C: size, time zone,
+    NTP source/last sync, RDP, features)
+- **Password:** `WINDOWS_ADMIN_PASSWORD` from the environment (CI, W4), otherwise
+  `playbooks/vars/windows-vault.yml` loaded by the play itself. The hypervisor play never
+  sees it.
+- **macOS:** `ansible_winrm_proxy: null`. Without it the Mac's forked Ansible workers
+  crash ("A worker was found in a dead state"): requests looks up the system proxy
+  through a macOS API that isn't fork-safe.
+- **Runner:** `hypervisor-prep.yml` adds `pywinrm==0.5.0` to `/opt/vm-builder/venv` and
+  `ansible.windows` to `/opt/vm-builder/collections`; `vm-validate` installs it too. Both
+  are needed for **every** build: Ansible resolves modules when it loads the playbook.
+- **Checked on win01:** destroy → build → baseline in 140 s; Eastern Standard Time, NTP
+  synced from `*.ca.pool.ntp.org`, RDP reachable from the Mac, `Web-Server` installed (IIS
+  answers HTTP 200); re-run `changed=0`; password found **0** times in the playbook logs.
+
 ### WinRM server certificate
 
 cloudbase-init creates a self-signed HTTPS certificate per VM. Ansible connects with
@@ -260,9 +284,9 @@ build time.
 |---|---|---|
 | **W1** | Packer + virtio-win on compute02 (`hypervisor-prep.yml`), ISO pins, Packer template + `autounattend.xml` + scripts, `windows-image.yml` | a `windows-2022-<date>-base.qcow2` exists in the pool; booting a throwaway copy shows sysprep OOBE handing over to cloudbase-init |
 | **W2** | `terraform/vm` OS switch, cloudbase-init template, UEFI/NVRAM/VNC; validator + defaults | `win01` built **by hand** (`vm-build.yml`) gets a guest-agent IP, has 5986 open, and accepts a WinRM login as `ansible` from the Mac; **the password appears in no plan file, state or log** (grep-checked) |
-| **W3** | `baseline_windows` (timezone, NTP, firewall, features, password re-set, marker) + `pywinrm` in venvs | baseline reports Server 2022, correct timezone, NTP synced, features installed; re-run `changed=0` |
+| **W3** | `baseline_windows` (timezone, NTP, firewall, features, marker) + `pywinrm` in venvs (password re-set dropped: it can't work, see §9) | baseline reports Server 2022, correct timezone, NTP synced, features installed; re-run `changed=0` |
 | **W4** | GitOps: `WINDOWS_ADMIN_PASSWORD` environment secret + `ansible.windows` on the runner; end-to-end via PR | add `vms/win01.yml` → approve → built; edit → restart guard works; delete → approve → destroyed; base image untouched; the plan job has no access to the secret |
-| **W5** | docs: Windows sections in build-vm.md (Part A) | how-to covers add/rebuild/refresh image/troubleshooting |
+| **W5** | docs: Windows sections in build-vm.md (Part A); `windows-rotate-password.yml` (previous password from a second vault key, sets the new one on every Windows VM) | how-to covers add/rebuild/refresh image/rotate password/troubleshooting; a rotation on win01 works and a re-run with the new password connects |
 
 ## 9. Risks and open points
 
@@ -279,8 +303,16 @@ build time.
 - **NetBIOS 15-character names:** the validator enforces it.
 - **Server certificate validation is off** (see §6). It's encrypted and LAN-only, but not
   pinned.
-- **Shared admin password** across all Windows VMs (your choice). Keep it strong; rotate
-  by updating the vault + environment secret and re-running builds.
+- **Shared admin password** across all Windows VMs (your choice). Keep it strong.
+- **Password rotation: option 1 chosen (2026-11-20), built in W5.** Re-running builds
+  does **not** rotate it (see "Where the password lives"). Options considered:
+  1. **(chosen)** a `windows-rotate-password.yml` that connects to each Windows VM with
+     the **previous** password (a second vault key, used only for this), sets the new one,
+     then you rebuild the golden image so new VMs get it too
+  2. set it through the guest agent (no login needed). Simpler, but the new password
+     passes through `virsh` on compute02's command line, where any local user can see it
+     in the process list
+  3. rotate by rebuilding every Windows VM from a new image (only for disposable VMs)
 - **The evaluation ISO is the March 2022 release build** (Last-Modified 2022-03-16), so
   the first image build has to install years of cumulative updates. They're cumulative, so
   it's a few large downloads, not hundreds.

@@ -449,14 +449,17 @@
         timeout: 600
       when: vm.windows | bool
 
-    - name: Report (Windows)
-      ansible.builtin.debug:
-        msg:
-          - "VM {{ vm.name }} (Windows Server 2022) ready at {{ vm_ip.stdout }}: WinRM HTTPS on 5986, user ansible"
-          - "MAC {{ vm.mac }} (use it for a DHCP reservation on the router)"
-          - "{{ vm_vcpus }} vCPU, {{ vm_memory_mib }} MiB RAM, {{ vm_disk_gib }} GiB disk"
-          - "Console (emergencies): ssh -L 5900:127.0.0.1:<port> {{ inventory_hostname }}, port from: virsh vncdisplay {{ vm.name }}"
+    # The password is NOT set here: the Windows baseline play loads it itself, so it never
+    # passes through this play or its host vars.
+    - name: Add the VM to this run's inventory (Windows; baselined below over WinRM)
       when: vm.windows | bool
+      ansible.builtin.add_host:
+        name: "{{ vm.name }}"
+        groups: [new_windows_vm]
+        ansible_host: "{{ vm_ip.stdout }}"
+        vm_mac_resolved: "{{ vm.mac }}"
+        vm_hypervisor: "{{ inventory_hostname }}"
+      changed_when: false
 
     - name: Add the VM to this run's inventory (Linux; baselined below over SSH)
       when: not vm.windows | bool
@@ -570,3 +573,180 @@
           - "{{ vm_vcpus }} vCPU, {{ vm_memory_mib }} MiB RAM, {{ vm_disk_gib }} GiB disk"
           - "{{ vm_state.stdout_lines }}"
           - "Inventory line: {{ inventory_hostname }}: { ansible_host: {{ ansible_host }} }"
+
+# ---------------------------------------------------------------------------
+# Windows baseline over WinRM HTTPS (build-windows-vm.md §6). Connects as the image's
+# local admin 'ansible'. The password comes from WINDOWS_ADMIN_PASSWORD (CI: the
+# approved job's environment secret) or else the vault (Mac); every task that could
+# show it uses no_log, and it's never written anywhere.
+- name: Baseline the Windows VM
+  hosts: new_windows_vm
+  gather_facts: false
+  become: false          # ansible.cfg defaults to sudo; 'ansible' is already an admin
+  vars_files:
+    - vars/vm_defaults.yml
+  vars:
+    ansible_connection: winrm
+    ansible_port: 5986
+    ansible_winrm_scheme: https
+    ansible_winrm_transport: ntlm
+    # Each VM has its own self-signed certificate from cloudbase-init; traffic is still
+    # TLS-encrypted and 5986 only accepts the LAN (build-windows-vm.md, "WinRM server certificate")
+    ansible_winrm_server_cert_validation: ignore
+    # No proxy lookup: on macOS it goes through the system proxy API, which crashes
+    # Ansible's forked workers ("A worker was found in a dead state"). VMs are on the LAN.
+    ansible_winrm_proxy: null
+    ansible_user: ansible
+    ansible_password: "{{ lookup('ansible.builtin.env', 'WINDOWS_ADMIN_PASSWORD') | default(vault_windows_admin_password | default(''), true) }}"
+    win_tz_id: "{{ windows_timezone_ids[vm_timezone] | default('') }}"
+    ntp_server_list: "{{ ntp_pools | map('regex_replace', '$', ',0x8') | join(' ') }}"
+    baseline_key: HKLM:\SOFTWARE\VMBuilder
+
+  pre_tasks:
+    - name: Load the Windows admin password from the vault (unless the environment has it)
+      ansible.builtin.include_vars:
+        file: vars/windows-vault.yml
+      when: lookup('ansible.builtin.env', 'WINDOWS_ADMIN_PASSWORD') | length == 0
+      no_log: true
+
+    - name: Require the password and a Windows time zone for vm_timezone
+      ansible.builtin.assert:
+        that:
+          - ansible_password | length >= 8
+          - win_tz_id | length > 0
+        fail_msg: >-
+          Need the Windows admin password (WINDOWS_ADMIN_PASSWORD or
+          playbooks/vars/windows-vault.yml) and a Windows time zone for vm_timezone
+          '{{ vm_timezone }}' (add it to windows_timezone_ids in vars/vm_defaults.yml).
+        quiet: true
+      no_log: true
+
+  handlers:
+    - name: Apply w32time settings
+      ansible.windows.win_powershell:
+        script: |
+          w32tm /config /update | Out-Null
+          Restart-Service w32time
+          w32tm /resync /rediscover | Out-Null
+
+  tasks:
+    - name: Wait for WinRM
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Check whether the baseline has completed before
+      ansible.windows.win_reg_stat:
+        path: "{{ baseline_key }}"
+        name: BaselineDone
+      register: baseline_marker
+
+    - name: Set the time zone ({{ vm_timezone }} = {{ win_tz_id }})
+      ansible.windows.win_powershell:
+        parameters:
+          Id: "{{ win_tz_id }}"
+        script: |
+          param([string]$Id)
+          $Ansible.Changed = (Get-TimeZone).Id -ne $Id
+          if ($Ansible.Changed) { Set-TimeZone -Id $Id }
+
+    # Same NTP servers as Linux (chrony) and the other hosts. 0x8 = client mode.
+    - name: Point w32time at {{ ntp_pools | join(', ') }}
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters
+        name: "{{ item.name }}"
+        data: "{{ item.data }}"
+        type: string
+      loop:
+        - { name: NtpServer, data: "{{ ntp_server_list }}" }
+        - { name: Type, data: NTP }
+      notify: Apply w32time settings
+
+    - name: Run w32time automatically (a workgroup server starts it only on demand)
+      ansible.windows.win_service:
+        name: w32time
+        start_mode: auto
+        state: started
+      notify: Apply w32time settings
+
+    - name: Apply time settings now
+      ansible.builtin.meta: flush_handlers
+
+    # RDP: on, with Network Level Authentication, LAN only. WinRM 5986: LAN only (also
+    # set by the VM's user data; enforced here so a drift is put back).
+    - name: Enable Remote Desktop (NLA required)
+      ansible.windows.win_regedit:
+        path: "{{ item.path }}"
+        name: "{{ item.name }}"
+        data: "{{ item.data }}"
+        type: dword
+      loop:
+        - { path: 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server', name: fDenyTSConnections, data: 0 }
+        - { path: 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp', name: UserAuthentication, data: 1 }
+
+    - name: Allow RDP (3389) and WinRM HTTPS (5986) from the LAN only
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Changed = $false
+          $rules = @(Get-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -Direction Inbound) +   # Remote Desktop
+                   @(Get-NetFirewallPortFilter -Protocol TCP | Where-Object LocalPort -eq 5986 | Get-NetFirewallRule)
+          foreach ($r in $rules) {
+            $addr = ($r | Get-NetFirewallAddressFilter).RemoteAddress -join ','
+            if ($r.Enabled -ne 'True' -or $r.Profile -ne 'Any' -or $addr -ne 'LocalSubnet') {
+              $r | Set-NetFirewallRule -Enabled True -Profile Any -RemoteAddress LocalSubnet
+              $Ansible.Changed = $true
+            }
+          }
+          if (-not ($rules | Where-Object { ($_ | Get-NetFirewallPortFilter).LocalPort -eq 5986 })) {
+            throw 'no firewall rule for WinRM HTTPS (5986) found'
+          }
+
+    - name: Install Windows features {{ vm_windows_features }}
+      ansible.windows.win_feature:
+        name: "{{ vm_windows_features }}"
+        state: present
+        include_management_tools: true
+      register: features
+      when: vm_windows_features | length > 0
+
+    - name: Reboot if a feature needs it
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+      when: features.reboot_required | default(false)
+
+    - name: Record that the baseline completed
+      ansible.windows.win_regedit:
+        path: "{{ baseline_key }}"
+        name: BaselineDone
+        data: baseline completed by vm-build.yml
+        type: string
+      when: not baseline_marker.exists
+
+    - name: Collect the VM's state
+      ansible.windows.win_powershell:
+        parameters:
+          Features: "{{ vm_windows_features }}"
+        script: |
+          param([string[]]$Features)
+          $Ansible.Changed = $false
+          $os = Get-CimInstance Win32_OperatingSystem
+          $sync = (w32tm /query /status /verbose | Select-String '^(Source|Last Successful Sync Time):') -join '; '
+          $sync = $sync -replace 'Last Successful Sync Time', 'last sync'
+          @(
+            "os=$($os.Caption) build $($os.BuildNumber)"
+            "c_drive_gib=$([math]::Round((Get-Volume C).Size / 1GB))"
+            "tz=$((Get-TimeZone).Id)"
+            "ntp=$sync"
+            "rdp=$(if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server').fDenyTSConnections -eq 0) { 'on' } else { 'off' })"
+            "features=$((@($Features | Where-Object { $_ } | Where-Object { (Get-WindowsFeature $_).Installed })) -join ',')"
+          )
+      register: vm_state
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ inventory_hostname }} (Windows Server 2022) ready at {{ ansible_host }}: WinRM HTTPS 5986 and RDP 3389 (LAN only), user ansible"
+          - "MAC {{ vm_mac_resolved }} (use it for a DHCP reservation on the router)"
+          - "{{ vm_vcpus }} vCPU, {{ vm_memory_mib }} MiB RAM, {{ vm_disk_gib }} GiB disk"
+          - "{{ vm_state.output }}"
+          - "Console (emergencies): ssh -L 5900:127.0.0.1:<port> {{ vm_hypervisor }}, port from: virsh vncdisplay {{ inventory_hostname }}"
+          - "Inventory line: {{ inventory_hostname }}: { ansible_host: {{ ansible_host }}, ansible_connection: winrm, ansible_port: 5986 }"
