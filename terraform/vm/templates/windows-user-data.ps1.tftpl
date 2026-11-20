@@ -1,0 +1,17 @@
+#ps1_sysnative
+# cloudbase-init user data for Windows VMs (runs once, as SYSTEM, after the
+# ConfigWinRMListener plugin has created the HTTPS listener on 5986).
+# No credentials here: the 'ansible' admin and its password are in the golden image.
+$ErrorActionPreference = 'Stop'
+
+# WinRM HTTPS only from the local subnet (the LAN), on every firewall profile: a new
+# VM's network starts out as "Public".
+$rules = Get-NetFirewallPortFilter -Protocol TCP |
+    Where-Object LocalPort -eq 5986 | Get-NetFirewallRule
+if ($rules) {
+    $rules | Set-NetFirewallRule -Profile Any -RemoteAddress LocalSubnet -Enabled True
+} else {
+    New-NetFirewallRule -Name vmb-winrm-https -DisplayName 'WinRM HTTPS (LAN)' `
+        -Direction Inbound -Protocol TCP -LocalPort 5986 `
+        -RemoteAddress LocalSubnet -Profile Any -Action Allow | Out-Null
+}

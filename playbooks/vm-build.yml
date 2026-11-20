@@ -39,32 +39,55 @@
         that:
           - vm_name is defined
           - vm_name is match('^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$')
+          - vm_os in ['ubuntu', 'windows-2022']
           - vm_vcpus | int >= 1 and vm_vcpus | int <= 16
           - vm_memory_mib | int >= 512 and vm_memory_mib | int <= 16384
           - vm_disk_gib | int >= 5 and vm_disk_gib | int <= 500
-          - vm_ubuntu_release | string in ubuntu_images
           - vm_firmware in ['bios', 'uefi']
           - vm_cpu_mode in ['host-passthrough', 'host-model']
           - vm_mac == '' or vm_mac is match('^52:54:00(:[0-9a-f]{2}){3}$')
-          - vm_ssh_authorized_keys | length > 0
           - vm_extra_disks | map(attribute='size_gib') | select('integer') | list | length == vm_extra_disks | length
-          - vm_passwordless_sudo or vm_password_login
           - vm_phase in ['all', 'plan', 'apply']
         fail_msg: >-
-          Invalid spec. Check: vm_name (lowercase, digits, '-', max 32), vm_vcpus 1-16,
-          vm_memory_mib 512-16384, vm_disk_gib 5-500, vm_ubuntu_release in
-          {{ ubuntu_images.keys() | list }}, vm_firmware bios|uefi, vm_cpu_mode
-          host-passthrough|host-model, vm_mac 52:54:00:xx:xx:xx, at least one SSH key,
-          extra disks as [{size_gib: N}], and sudo must be usable (passwordless sudo or
-          password login).
+          Invalid spec. Check: vm_name (lowercase, digits, '-', max 32), vm_os
+          ubuntu|windows-2022, vm_vcpus 1-16, vm_memory_mib 512-16384, vm_disk_gib 5-500,
+          vm_firmware bios|uefi, vm_cpu_mode host-passthrough|host-model, vm_mac
+          52:54:00:xx:xx:xx, and extra disks as [{size_gib: N}].
         quiet: true
+
+    - name: Validate Linux settings
+      ansible.builtin.assert:
+        that:
+          - vm_ubuntu_release | string in ubuntu_images
+          - vm_ssh_authorized_keys | length > 0
+          - vm_passwordless_sudo or vm_password_login
+        fail_msg: >-
+          Invalid spec. Check: vm_ubuntu_release in {{ ubuntu_images.keys() | list }},
+          at least one SSH key, and sudo must be usable (passwordless sudo or password login).
+        quiet: true
+      when: vm_os == 'ubuntu'
+
+    - name: Validate Windows settings (build-windows-vm.md §5)
+      ansible.builtin.assert:
+        that:
+          - vm_name | length <= 15
+          - vm_memory_mib | int >= 2048
+          - vm_disk_gib | int >= 40
+        fail_msg: >-
+          Invalid Windows spec: vm_name at most 15 characters (NetBIOS limit),
+          vm_memory_mib at least 2048, vm_disk_gib at least 40 (the base image's size).
+        quiet: true
+      when: vm_os != 'ubuntu'
 
     - name: Resolve settings
       ansible.builtin.set_fact:
         vm:
           name: "{{ vm_name }}"
           mac: "{{ vm_mac if vm_mac else derived_mac | trim }}"
-          release: "{{ vm_ubuntu_release | string }}"
+          windows: "{{ vm_os != 'ubuntu' }}"
+          # Base volume key in terraform/images: an Ubuntu release, or the Windows build
+          # prefix (the newest completed build is picked in Preflight)
+          release: "{{ vm_ubuntu_release | string if vm_os == 'ubuntu' else vm_os }}"
 
   tasks:
     # ---------- Preflight ----------
@@ -74,9 +97,23 @@
       register: base_out
       changed_when: false
 
-    - name: Pick the base volume for Ubuntu {{ vm.release }}
+    - name: Pick the base volume for {{ vm.release }}
       ansible.builtin.set_fact:
-        base_volume_path: "{{ (base_out.stdout | from_json)[vm.release].path }}"
+        # Windows: the newest completed build (keys are windows-2022-YYYYMMDD). An
+        # existing VM stays on its own base (terraform/vm ignores backing_store changes).
+        base_volume_path: >-
+          {{ bases[vm.release].path if not vm.windows | bool
+             else (bases[win_key].path if win_key else '') }}
+      vars:
+        bases: "{{ base_out.stdout | from_json }}"
+        win_key: "{{ bases.keys() | select('match', vm.release ~ '-[0-9]{8}$') | sort | last | default('') }}"
+
+    - name: Require a Windows golden image
+      ansible.builtin.assert:
+        that: base_volume_path | trim | length > 0
+        fail_msg: "No {{ vm.release }} base image yet: run playbooks/windows-image.yml first."
+        quiet: true
+      when: vm.windows | bool
 
     - name: Gather host state
       ansible.builtin.shell: |
@@ -171,6 +208,7 @@
         tfvars:
           libvirt_uri: "{{ libvirt_uri }}"
           pool: "{{ libvirt_pool }}"
+          os: "{{ 'windows' if vm.windows | bool else 'ubuntu' }}"
           name: "{{ vm.name }}"
           description: "{{ vm_description }}"
           vcpus: "{{ vm_vcpus | int }}"
@@ -180,13 +218,15 @@
           base_volume_path: "{{ base_volume_path }}"
           bridge: "{{ vm_bridge }}"
           mac: "{{ vm.mac }}"
-          firmware: "{{ vm_firmware }}"
+          firmware: "{{ 'uefi' if vm.windows | bool else vm_firmware }}"
           cpu_mode: "{{ vm_cpu_mode }}"
           autostart: "{{ vm_autostart | bool }}"
-          user: "{{ vm_user }}"
-          ssh_authorized_keys: "{{ vm_ssh_authorized_keys }}"
-          passwordless_sudo: "{{ vm_passwordless_sudo | bool }}"
-          password_login: "{{ vm_password_login | bool }}"
+          # Linux (cloud-init) only; Windows gets neutral values. No Windows credentials
+          # ever go to Terraform: the admin account is in the golden image.
+          user: "{{ '' if vm.windows | bool else vm_user }}"
+          ssh_authorized_keys: "{{ [] if vm.windows | bool else vm_ssh_authorized_keys }}"
+          passwordless_sudo: "{{ false if vm.windows | bool else vm_passwordless_sudo | bool }}"
+          password_login: "{{ false if vm.windows | bool else vm_password_login | bool }}"
           timezone: "{{ vm_timezone }}"
 
     # ---------- Terraform: init, workspace, plan ----------
@@ -357,13 +397,15 @@
         flat: true
 
     # ---------- Find the VM ----------
+    # Skips loopback and link-local 169.254.x.x: Windows reports an APIPA address
+    # before DHCP has answered.
     - name: Wait for the guest agent to report an IPv4 address
       ansible.builtin.shell: |
         virsh -c {{ libvirt_uri }} domifaddr {{ vm.name }} --source agent 2>/dev/null \
-          | awk '$3=="ipv4" && $4 !~ /^127\./ {split($4,a,"/"); print a[1]; exit}'
+          | awk '$3=="ipv4" && $4 !~ /^(127|169\.254)\./ {split($4,a,"/"); print a[1]; exit}'
       register: vm_ip
       until: vm_ip.stdout | length > 0
-      retries: 60
+      retries: "{{ 120 if vm.windows | bool else 60 }}"   # Windows: sysprep OOBE + cloudbase-init reboot
       delay: 5
       changed_when: false
 
@@ -372,9 +414,52 @@
         name: "{{ vm_ip.stdout }}"
         state: absent
       delegate_to: localhost
-      when: creating or replacing
+      when: (creating or replacing) and not vm.windows | bool
 
-    - name: Add the VM to this run's inventory
+    # ---------- Windows: WinRM over HTTPS (the baseline over WinRM is W3) ----------
+    # The Windows "cloud-init status --wait": cloudbase-init marks each finished plugin
+    # in the registry under its instance-id (= vm name). UserData runs last and narrows
+    # the 5986 firewall rule to the LAN, so wait for it rather than for the open port
+    # (which ConfigWinRMListener opens a few seconds earlier, to any address).
+    - name: Wait for cloudbase-init to finish (UserData plugin done)
+      ansible.builtin.shell: |
+        set -uo pipefail
+        a() { virsh -c {{ libvirt_uri }} qemu-agent-command {{ vm.name }} "$1" 2>/dev/null; }
+        pid=$(a '{"execute":"guest-exec","arguments":{"path":"reg.exe","arg":["query","HKLM\\SOFTWARE\\Cloudbase Solutions\\Cloudbase-Init\\{{ vm.name }}\\Plugins","/v","UserDataPlugin"],"capture-output":true}}' \
+              | grep -o '"pid":[0-9]*' | cut -d: -f2)
+        [ -n "$pid" ] || exit 1
+        for i in $(seq 1 10); do
+          r=$(a "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}")
+          echo "$r" | grep -q '"exited":true' && break
+          sleep 1
+        done
+        echo "$r" | grep -o '"out-data":"[^"]*"' | cut -d'"' -f4 | base64 -d | grep -qE 'UserDataPlugin +REG_DWORD +0x1'
+      args: { executable: /bin/bash }
+      register: cloudbase_done
+      until: cloudbase_done.rc == 0
+      retries: 60
+      delay: 5
+      changed_when: false
+      when: vm.windows | bool
+
+    - name: Wait for WinRM HTTPS (5986) on {{ vm_ip.stdout }}
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip.stdout }}"
+        port: 5986
+        timeout: 600
+      when: vm.windows | bool
+
+    - name: Report (Windows)
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ vm.name }} (Windows Server 2022) ready at {{ vm_ip.stdout }}: WinRM HTTPS on 5986, user ansible"
+          - "MAC {{ vm.mac }} (use it for a DHCP reservation on the router)"
+          - "{{ vm_vcpus }} vCPU, {{ vm_memory_mib }} MiB RAM, {{ vm_disk_gib }} GiB disk"
+          - "Console (emergencies): ssh -L 5900:127.0.0.1:<port> {{ inventory_hostname }}, port from: virsh vncdisplay {{ vm.name }}"
+      when: vm.windows | bool
+
+    - name: Add the VM to this run's inventory (Linux; baselined below over SSH)
+      when: not vm.windows | bool
       ansible.builtin.add_host:
         name: "{{ vm.name }}"
         groups: [new_vm]

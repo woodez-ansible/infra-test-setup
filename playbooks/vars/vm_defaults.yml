@@ -3,9 +3,11 @@
 # hypervisor play and the new-VM play), so the VM itself sees them too. A spec file
 # (vms/<name>.yml, passed with -e @vms/<name>.yml) overrides any of these.
 # See build-vm.md §4 for what each one does.
+vm_os: ubuntu                    # ubuntu | windows-2022 (build-windows-vm.md)
 vm_vcpus: 2
-vm_memory_mib: 2048
-vm_disk_gib: 20
+# Windows needs more: 4096 MiB / 60 GiB by default (minimums 2048 / 40)
+vm_memory_mib: "{{ 4096 if vm_os is match('windows') else 2048 }}"
+vm_disk_gib: "{{ 60 if vm_os is match('windows') else 20 }}"
 vm_extra_disks: []
 vm_ubuntu_release: "26.04"
 vm_bridge: "{{ vm_bridge_default }}"
@@ -20,8 +22,9 @@ vm_password_login: false
 vm_timezone: America/Toronto
 vm_packages: []
 vm_apt_upgrade: true             # full upgrade on first build only
+vm_windows_features: []          # Windows only: features/roles to install, e.g. [Web-Server]
 vm_autostart: true
-vm_firmware: bios                # bios | uefi
+vm_firmware: bios                # bios | uefi (Windows is always uefi)
 vm_cpu_mode: host-passthrough    # host-passthrough | host-model
 vm_description: ""
 vm_allow_restart: false          # allow ANY in-place change (vCPU, RAM, description, ...) to restart the VM
