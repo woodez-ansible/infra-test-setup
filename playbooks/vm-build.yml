@@ -603,6 +603,17 @@
     baseline_key: HKLM:\SOFTWARE\VMBuilder
 
   pre_tasks:
+    - name: In CI the password must come from the vm-build environment secret
+      ansible.builtin.assert:
+        that: lookup('ansible.builtin.env', 'WINDOWS_ADMIN_PASSWORD') | length > 0
+        fail_msg: >-
+          WINDOWS_ADMIN_PASSWORD is empty. Set it as a secret of the GitHub environment
+          'vm-build' (gh secret set WINDOWS_ADMIN_PASSWORD --env vm-build); the runner has
+          no vault.
+        quiet: true
+      when: lookup('ansible.builtin.env', 'GITHUB_ACTIONS') == 'true'
+      no_log: true
+
     - name: Load the Windows admin password from the vault (unless the environment has it)
       ansible.builtin.include_vars:
         file: vars/windows-vault.yml
