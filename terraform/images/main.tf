@@ -3,7 +3,10 @@
 resource "libvirt_volume" "base" {
   for_each = var.images
 
-  name = "ubuntu-${each.key}-${each.value.build}-base.qcow2"
+  # Ubuntu keys are releases ("26.04"); Windows keys are dated builds
+  # ("windows-2022-20261120"). Ubuntu names must not change: renaming forces a replacement,
+  # which prevent_destroy blocks.
+  name = startswith(each.key, "windows-") ? "${each.key}-base.qcow2" : "ubuntu-${each.key}-${each.value.build}-base.qcow2"
   pool = var.pool
 
   target = {

@@ -47,3 +47,36 @@ gha_runner_name: compute02
 gha_runner_labels: [compute02, vm-builder]   # GitHub adds self-hosted, Linux, X64
 gha_runner_venv: "{{ vm_builder_dir }}/venv" # Ansible for CI jobs
 gha_runner_ansible_core: "2.21.4"
+
+# ---------- Windows golden image (build-windows-vm.md) ----------
+# Big files live on the pool's filesystem (/var/lib/libvirt/images, ~270 GiB free), in
+# hidden directories: root has only ~24 GiB. libvirt lists them as "dir" entries in the
+# pool; they're not disk images and nothing builds from them.
+win_cache_dir: /var/lib/libvirt/images/.vm-builder-cache
+win_packer_dir: /var/lib/libvirt/images/.vm-builder-packer
+packer_version: "1.16.2"
+packer_qemu_plugin_version: "1.1.8"
+packer_plugin_dir: "{{ vm_builder_dir }}/packer-plugins"
+
+windows_2022:
+  # Microsoft Evaluation Center (180-day evaluation). The redirect target changes with new
+  # media; the SHA-256 pin makes any change fail loudly. Build 20348, March 2022 media.
+  iso_url: "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
+  iso_file: SERVER_EVAL_2022_x64FRE_en-us.iso
+  iso_sha256: 3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325
+  # install.wim index 2 = Standard, Desktop Experience (checked with wiminfo)
+  image_name: "Windows Server 2022 SERVERSTANDARD"
+
+virtio_win:
+  version: "0.1.302"
+  # Fedora publishes MD5s for the RPMs only; the ISO is extracted from the verified RPM
+  rpm_url: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302-1.noarch.rpm
+  rpm_md5: 66f65c16ab3e8dfe12c2855a0d1ac303
+  iso_file: virtio-win-0.1.302.iso
+  iso_sha256: 303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d
+
+cloudbase_init:
+  version: "1.1.9"
+  msi_url: https://github.com/cloudbase/cloudbase-init/releases/download/1.1.9/CloudbaseInitSetup_1_1_9_x64.msi
+  msi_file: CloudbaseInitSetup_1_1_9_x64.msi
+  msi_sha256: ffbf80515a7311ed00800276a6af7aab23b41d7acf13e79ce3d2d56844f638f7
