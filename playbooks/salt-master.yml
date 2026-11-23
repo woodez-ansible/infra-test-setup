@@ -1,0 +1,257 @@
+---
+# Salt master + salt-api on compute02 (SALT.md).
+#   ansible-playbook playbooks/salt-master.yml
+# Needs playbooks/vars/salt-vault.yml (vault_salt_api_password); create it once with
+#   ansible-vault create playbooks/vars/salt-vault.yml
+# It's loaded here explicitly, NOT from group_vars/hypervisors: the GitHub runner reads
+# those and has no vault, so a vault there would break vm-gitops.
+- name: Salt master and salt-api
+  hosts: hypervisors
+  become: true
+  gather_facts: false
+
+  vars:
+    # Salt 3008 is the current LTS (released 2026-05-27, active support until 2027-06).
+    # The apt pin keeps every salt-* package on 3008.x; bump salt_version for point releases.
+    salt_series: "3008"
+    salt_version: "3008.5"
+    salt_repo_url: https://packages.broadcom.com/artifactory/saltproject-deb
+    salt_key_url: https://packages.broadcom.com/artifactory/api/security/keypair/SaltProjectKey/public
+    # "Salt Project Packaging", fingerprint 1085 7FFD D3F9 1EAE 577A 21D6 64CB BC81 73D7 6B3F
+    salt_key_sha256: 36decef986477acb8ba2a1fc4041bcf9f22229ef6c939d0317c9e36a9d142b34
+    salt_key_file: /etc/apt/keyrings/salt-archive-keyring.asc
+    salt_bind_ip: "{{ ansible_host }}"         # 192.168.2.6: the LAN, not every interface
+    salt_auto_accept: true
+    salt_file_root: /srv/salt
+    salt_pillar_root: /srv/pillar
+    salt_api_port: 8000
+    salt_api_user: saltapi
+    salt_api_cert_dir: /etc/salt/pki/api
+    # Fixed per-host salt so the password hash, and the play, are stable across runs
+    salt_api_pw_salt: "{{ (inventory_hostname ~ '-' ~ salt_api_user) | hash('sha1') | truncate(16, true, '') }}"
+
+  pre_tasks:
+    - name: Load the salt-api password from the vault
+      ansible.builtin.include_vars:
+        file: vars/salt-vault.yml
+      no_log: true
+
+    - name: Require the salt-api password
+      ansible.builtin.assert:
+        that: vault_salt_api_password | default('') | length >= 12
+        fail_msg: >-
+          Set vault_salt_api_password (12+ characters) in playbooks/vars/salt-vault.yml:
+          ansible-vault create playbooks/vars/salt-vault.yml
+        quiet: true
+      no_log: true
+
+  handlers:
+    - name: Restart salt-master
+      ansible.builtin.service:
+        name: salt-master
+        state: restarted
+
+    - name: Restart salt-api
+      ansible.builtin.service:
+        name: salt-api
+        state: restarted
+
+  tasks:
+    # ---------- Packages: Salt Project's signed repo, pinned to the LTS series ----------
+    - name: Install Salt Project's signing key (SHA-256 checked)
+      ansible.builtin.get_url:
+        url: "{{ salt_key_url }}"
+        dest: "{{ salt_key_file }}"
+        checksum: "sha256:{{ salt_key_sha256 }}"
+        mode: "0644"
+
+    - name: Add the Salt Project apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/salt.sources
+        mode: "0644"
+        content: |
+          # Managed by Ansible (playbooks/salt-master.yml); local edits are overwritten
+          Types: deb
+          URIs: {{ salt_repo_url }}
+          Suites: stable
+          Components: main
+          Signed-By: {{ salt_key_file }}
+
+    - name: Pin salt-* packages to {{ salt_series }}.x (no jump to a newer major release)
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/salt-pin-1001
+        mode: "0644"
+        content: |
+          # Managed by Ansible (playbooks/salt-master.yml); local edits are overwritten
+          Package: salt-*
+          Pin: version {{ salt_series }}.*
+          Pin-Priority: 1001
+
+    - name: Install salt-master and salt-api {{ salt_version }}
+      ansible.builtin.apt:
+        name:
+          - "salt-common={{ salt_version }}*"
+          - "salt-master={{ salt_version }}*"
+          - "salt-api={{ salt_version }}*"
+        update_cache: true
+        allow_change_held_packages: true
+
+    - name: Hold the Salt packages (upgrades are deliberate version bumps here)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [salt-common, salt-master, salt-api]
+
+    # ---------- Master ----------
+    - name: Create the state and pillar trees
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ salt_file_root }}"
+        - "{{ salt_pillar_root }}"
+
+    - name: Configure salt-master
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/salt/master.conf.j2"
+        dest: /etc/salt/master.d/10-master.conf
+        mode: "0644"
+      notify: Restart salt-master
+
+    # ---------- salt-api: TLS, PAM user, auth ----------
+    - name: Create the salt-api certificate directory
+      ansible.builtin.file:
+        path: "{{ salt_api_cert_dir }}"
+        state: directory
+        owner: salt
+        group: salt
+        mode: "0750"
+
+    - name: Create a self-signed certificate for salt-api (once, 10 years)
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -newkey
+          - rsa:3072
+          - -nodes
+          - -days
+          - "3650"
+          - -subj
+          - "/CN={{ inventory_hostname }}"
+          - -addext
+          - "subjectAltName=IP:{{ salt_bind_ip }},DNS:{{ inventory_hostname }}"
+          - -keyout
+          - "{{ salt_api_cert_dir }}/salt-api.key"
+          - -out
+          - "{{ salt_api_cert_dir }}/salt-api.crt"
+        creates: "{{ salt_api_cert_dir }}/salt-api.crt"
+      notify: Restart salt-api
+
+    - name: Let the salt user read the certificate and key
+      ansible.builtin.file:
+        path: "{{ salt_api_cert_dir }}/{{ item }}"
+        owner: salt
+        group: salt
+        mode: "0600"
+      loop: [salt-api.key, salt-api.crt]
+
+    # salt-master and salt-api run as 'salt', not root. PAM logins read /etc/shadow, so
+    # without this every API login fails (Salt docs: add the salt user to "shadow").
+    - name: Let the salt user check PAM passwords
+      ansible.builtin.user:
+        name: salt
+        groups: [shadow]
+        append: true
+      notify: [Restart salt-master, Restart salt-api]
+
+    # Hashed on the host from stdin (no passlib on the Mac, no password on a command line)
+    - name: Hash the salt-api password
+      ansible.builtin.command:
+        argv: [openssl, passwd, -6, -salt, "{{ salt_api_pw_salt }}", -stdin]
+        stdin: "{{ vault_salt_api_password }}"
+      register: salt_api_pw_hash
+      changed_when: false
+      no_log: true
+
+    - name: Create the API user {{ salt_api_user }} (no shell, no home)
+      ansible.builtin.user:
+        name: "{{ salt_api_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        password: "{{ salt_api_pw_hash.stdout }}"
+      no_log: true
+
+    - name: Configure salt-api and API permissions
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/salt/api.conf.j2"
+        dest: /etc/salt/master.d/20-api.conf
+        mode: "0644"
+      notify: [Restart salt-master, Restart salt-api]
+
+    - name: Start and enable salt-master and salt-api
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [salt-master, salt-api]
+
+    - name: Apply config changes now
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Checks ----------
+    - name: Wait for the master (4505/4506) and the API ({{ salt_api_port }}) to listen
+      ansible.builtin.wait_for:
+        host: "{{ salt_bind_ip }}"
+        port: "{{ item }}"
+        timeout: 60
+      loop: [4505, 4506, "{{ salt_api_port }}"]
+
+    # Proves the master answers on the CLI (fails the play otherwise). Its output isn't
+    # parsed: with no minions it prints a notice before the data.
+    - name: Ask the master for its minions (CLI)
+      ansible.builtin.command: salt-run manage.status
+      changed_when: false
+
+    - name: Log in to salt-api as {{ salt_api_user }}
+      ansible.builtin.uri:
+        url: "https://{{ salt_bind_ip }}:{{ salt_api_port }}/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ salt_api_user }}"
+          password: "{{ vault_salt_api_password }}"
+          eauth: pam
+        validate_certs: false        # self-signed
+        return_content: true
+      register: api_login
+      no_log: true
+
+    - name: Run a runner function through the API with the token
+      ansible.builtin.uri:
+        url: "https://{{ salt_bind_ip }}:{{ salt_api_port }}/"
+        method: POST
+        body_format: json
+        headers:
+          X-Auth-Token: "{{ api_login.json.return[0].token }}"
+        body: [{ client: runner, fun: manage.status }]
+        validate_certs: false
+        return_content: true
+      register: api_call
+      no_log: true
+
+    - name: Read the salt-master version
+      ansible.builtin.command: salt-master --version
+      register: master_version
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "{{ master_version.stdout }} on {{ inventory_hostname }} ({{ salt_bind_ip }}), auto_accept: {{ salt_auto_accept }}"
+          - "Minions (manage.status via the API): {{ api_call.json.return[0] }}"
+          - "salt-api: https://{{ salt_bind_ip }}:{{ salt_api_port }} login as {{ salt_api_user }} (eauth pam): HTTP {{ api_login.status }}, token issued: {{ api_login.json.return[0].token is defined }}; runner call via the API: HTTP {{ api_call.status }}"
+          - "States: {{ salt_file_root }}   Pillar: {{ salt_pillar_root }}"

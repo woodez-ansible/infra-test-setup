@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# Salt master settings for {{ inventory_hostname }} (playbooks/salt-master.yml).
+interface: {{ salt_bind_ip }}
+
+# Any minion that can reach 4505/4506 is accepted (decided 2026-11-23). To accept keys by
+# hand instead, set salt_auto_accept: false and use `salt-key -a <id>`.
+auto_accept: {{ salt_auto_accept | ternary('True', 'False') }}
+
+file_roots:
+  base:
+    - {{ salt_file_root }}
+pillar_roots:
+  base:
+    - {{ salt_pillar_root }}
+
+log_level_logfile: warning
