@@ -1,0 +1,15 @@
+---
+# How Ansible reaches Windows VMs built by the VM pipeline (build-vm.md A8.4): WinRM over
+# HTTPS as the image's local admin 'ansible'. Same settings vm-build.yml uses.
+ansible_connection: winrm
+ansible_port: 5986
+ansible_winrm_scheme: https
+ansible_winrm_transport: ntlm
+ansible_winrm_server_cert_validation: ignore   # each VM has its own self-signed cert
+ansible_winrm_proxy: null       # macOS: avoids a crash in Ansible's forked workers
+ansible_become: false           # the repo's ansible.cfg defaults to sudo
+ansible_user: ansible
+# Defined only once a playbook loads playbooks/vars/windows-vault.yml (include_vars).
+# Not stored here: group_vars are read by every play, and a vault in them would be
+# needed for every run.
+ansible_password: "{{ vault_windows_admin_password }}"

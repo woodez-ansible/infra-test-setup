@@ -1,0 +1,118 @@
+---
+# Install salt-minion on Windows VMs and connect them to the Salt master on compute02
+# (SALT.md). Run from the Mac:
+#   ansible-playbook playbooks/salt-minion-windows.yml -l win01
+# Needs the vault (Windows admin password) and the master from playbooks/salt-master.yml.
+# The master auto-accepts keys, so the minion is usable as soon as it starts.
+- name: Salt minion on Windows VMs
+  hosts: windows_vms
+  gather_facts: false
+
+  vars:
+    salt_version: "3008.5"            # must match the master (playbooks/salt-master.yml)
+    salt_master_ip: "{{ hostvars[groups['hypervisors'][0]].ansible_host }}"   # 192.168.2.6
+    salt_master_host: "{{ groups['hypervisors'][0] }}"                         # compute02
+    salt_minion_id: "{{ inventory_hostname }}"
+    salt_msi_name: "Salt-Minion-{{ salt_version }}-Py3-AMD64.msi"
+    salt_msi_url: "https://packages.broadcom.com/artifactory/saltproject-generic/windows/{{ salt_version }}/{{ salt_msi_name }}"
+    salt_msi_sha256: e0fb2c511649231988fd496ed730888372444dfe533fb13d01ccfd14878559bc
+    salt_download_dir: C:\Windows\Temp\salt
+    salt_conf_dir: C:\ProgramData\Salt Project\Salt\conf
+
+  pre_tasks:
+    - name: Load the Windows admin password from the vault
+      ansible.builtin.include_vars:
+        file: vars/windows-vault.yml
+      no_log: true
+
+    - name: Wait for WinRM
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+  handlers:
+    - name: Restart salt-minion
+      ansible.windows.win_service:
+        name: salt-minion
+        state: restarted
+
+  tasks:
+    # ---------- Install ----------
+    - name: Create the download directory
+      ansible.windows.win_file:
+        path: "{{ salt_download_dir }}"
+        state: directory
+
+    - name: Download salt-minion {{ salt_version }} (SHA-256 checked)
+      ansible.windows.win_get_url:
+        url: "{{ salt_msi_url }}"
+        dest: "{{ salt_download_dir }}\\{{ salt_msi_name }}"
+        checksum: "{{ salt_msi_sha256 }}"
+        checksum_algorithm: sha256
+
+    # MASTER/MINION_ID are the MSI's own properties; they write the minion config. Skipped
+    # once the salt-minion service exists (to upgrade, uninstall first or bump and adapt).
+    - name: Install salt-minion {{ salt_version }}
+      ansible.windows.win_package:
+        path: "{{ salt_download_dir }}\\{{ salt_msi_name }}"
+        arguments:
+          - MASTER={{ salt_master_ip }}
+          - MINION_ID={{ salt_minion_id }}
+          - START_MINION=1
+        creates_service: salt-minion
+        state: present
+
+    # Kept in a drop-in file so a later change (e.g. a new master IP) is applied by
+    # re-running this playbook, not only at install time.
+    - name: Point the minion at the master
+      ansible.windows.win_copy:
+        dest: "{{ salt_conf_dir }}\\minion.d\\10-ansible.conf"
+        content: |
+          # Managed by Ansible (playbooks/salt-minion-windows.yml); local edits are overwritten
+          master: {{ salt_master_ip }}
+          id: {{ salt_minion_id }}
+      notify: Restart salt-minion
+
+    - name: Run salt-minion automatically
+      ansible.windows.win_service:
+        name: salt-minion
+        start_mode: auto
+        state: started
+
+    - name: Apply config changes now
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Check from the master ----------
+    - name: Wait for the master to list {{ salt_minion_id }} as accepted (auto_accept)
+      ansible.builtin.command: salt-key --list=accepted --out=json
+      delegate_to: "{{ salt_master_host }}"
+      become: true
+      register: accepted
+      until: salt_minion_id in (accepted.stdout | from_json).get('minions', [])
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: Ping {{ salt_minion_id }} from the master
+      ansible.builtin.command: salt --out=json --static -t 30 {{ salt_minion_id }} test.ping
+      delegate_to: "{{ salt_master_host }}"
+      become: true
+      register: ping
+      # rc first: a minion that hasn't answered yet gives non-JSON output and rc != 0
+      until: ping.rc == 0 and (ping.stdout | from_json).get(salt_minion_id) is sameas true
+      retries: 6
+      delay: 10
+      changed_when: false
+
+    - name: Read the minion's OS and Salt version through the master
+      ansible.builtin.command: salt --out=json --static {{ salt_minion_id }} grains.item osfullname saltversion
+      delegate_to: "{{ salt_master_host }}"
+      become: true
+      register: grains
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "{{ salt_minion_id }}: salt-minion {{ (grains.stdout | from_json)[salt_minion_id].saltversion }} on {{ (grains.stdout | from_json)[salt_minion_id].osfullname }}"
+          - "Master {{ salt_master_host }} ({{ salt_master_ip }}): key accepted, test.ping = {{ (ping.stdout | from_json)[salt_minion_id] }}"
+          - "Try it on compute02: sudo salt {{ salt_minion_id }} cmd.run 'hostname'"

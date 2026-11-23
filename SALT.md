@@ -52,6 +52,30 @@ Tokens expire after 12 hours (Salt's default). On compute02 itself, the CLI work
 To see the password (terminal only; don't paste it anywhere):
 `ansible-vault view playbooks/vars/salt-vault.yml`.
 
+## Windows minions
+
+`playbooks/salt-minion-windows.yml` installs **salt-minion 3008.5** (same version as the
+master) on the Windows VMs in the `windows_vms` inventory group (`win01`) over WinRM:
+
+```bash
+source .venv/bin/activate
+ansible-playbook playbooks/salt-minion-windows.yml -l win01
+```
+
+1. downloads `Salt-Minion-3008.5-Py3-AMD64.msi` from Salt Project (SHA-256 checked) to
+   `C:\Windows\Temp\salt`
+2. installs it silently with `MASTER=192.168.2.6 MINION_ID=win01` (skipped if the
+   `salt-minion` service already exists)
+3. writes `C:\ProgramData\Salt Project\Salt\conf\minion.d\10-ansible.conf` (master + id),
+   so a later change is applied by re-running; restarts the service only if it changed
+4. on compute02: waits until the master lists `win01` as accepted (auto-accept), then
+   `test.ping` and reads the minion's OS and Salt version
+
+It needs the Windows admin password from `playbooks/vars/windows-vault.yml` (the playbook
+loads it). Add another Windows VM by listing it under `windows_vms` in
+`inventory/hosts.yml`. Then, on compute02: `sudo salt win01 test.ping`,
+`sudo salt win01 cmd.run 'hostname'`.
+
 ## Operating it
 
 | Task | How |
