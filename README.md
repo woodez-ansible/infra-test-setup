@@ -6,7 +6,8 @@ Ansible, Terraform and GitHub Actions automation for a homelab on `192.168.2.0/2
   Server VMs from spec files, GitOps-style (§2)
 - a **3-node Kubernetes cluster** built in phases with kubeadm, with CI/CD for apps
   through GitHub Actions (§3)
-- a **PostgreSQL / web host**, `db01` (§4)
+- a **Salt master and salt-api** on `compute02` (§4)
+- a **PostgreSQL / web host**, `db01` (§5)
 
 This README is the design overview: how each system is built, why it's built that way,
 and where to find the details. The step-by-step how-tos are linked from each section.
@@ -17,7 +18,7 @@ and where to find the details. The step-by-step how-tos are linked from each sec
 
 | Host | IP | Role | Managed by |
 |---|---|---|---|
-| `compute02` | 192.168.2.6 | KVM/libvirt hypervisor; GitHub Actions self-hosted runner for the VM pipeline | `playbooks/hypervisor-prep.yml` |
+| `compute02` | 192.168.2.6 | KVM/libvirt hypervisor; GitHub Actions self-hosted runner for the VM pipeline; Salt master + salt-api | `playbooks/hypervisor-prep.yml`, `salt-master.yml` |
 | `master` | 192.168.2.176 | Kubernetes control plane | `playbooks/k8s.yml` |
 | `kube01`, `kube02` | 192.168.2.178, .180 | Kubernetes workers | `playbooks/k8s.yml` |
 | `db01` | 192.168.2.174 | PostgreSQL 17, nginx web app | `playbooks/postgres.yml`, `webapp.yml` |
@@ -64,6 +65,8 @@ build-vm.md               VM pipeline how-to (Part A) and design history (Part B
 build-windows-vm.md       Windows design, golden image, build log
 k8s-howto-3node.md        Kubernetes build/operations guide (§8: CI/CD admin)
 dev-howto-k8s.md          app developers: deploying to the cluster
+RDP-WIN.md                Remote Desktop into a Windows VM from a Mac
+SALT.md                   Salt master + salt-api on compute02
 inventory/                hosts.yml, ci.yml (runner), group_vars/
 playbooks/                hypervisor-prep, vm-build, vm-destroy, vm-list, windows-image,
                           k8s.yml + k8s/00..99, app-onboard/offboard, postgres, webapp
@@ -361,7 +364,21 @@ ansible-playbook playbooks/k8s/app-onboard.yml -e app=myapp -e repo=woodez/myapp
 
 ---
 
-## 4. db01: PostgreSQL and the web app
+## 4. Salt master and salt-api (compute02)
+
+**Guide:** [SALT.md](SALT.md). `playbooks/salt-master.yml` installs Salt **3008.5** (the
+current LTS, apt-pinned to `3008.*`) on compute02: the master on `192.168.2.6:4505/4506`
+with **auto-accepted** minion keys, states in `/srv/salt` and pillar in `/srv/pillar`, and
+**salt-api** (`rest_cherrypy`) on `https://192.168.2.6:8000` with a self-signed
+certificate. API clients log in through PAM as `saltapi`; the password is in
+`playbooks/vars/salt-vault.yml` (Ansible Vault), loaded by the playbook itself, not from
+`group_vars/hypervisors` (the GitHub runner has no vault).
+
+```bash
+ansible-playbook playbooks/salt-master.yml      # idempotent; ends with an API login check
+```
+
+## 5. db01: PostgreSQL and the web app
 
 ### PostgreSQL server (db01 / 192.168.2.174)
 

@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+# salt-api (rest_cherrypy) for {{ inventory_hostname }} (playbooks/salt-master.yml).
+# HTTPS only, self-signed certificate; clients log in as '{{ salt_api_user }}' (PAM).
+rest_cherrypy:
+  host: {{ salt_bind_ip }}
+  port: {{ salt_api_port }}
+  ssl_crt: {{ salt_api_cert_dir }}/salt-api.crt
+  ssl_key: {{ salt_api_cert_dir }}/salt-api.key
+
+# Salt 3006+ disables every API client type by default ("Client disabled: 'runner'").
+# Enable the ones the permissions below are for.
+netapi_enable_clients:
+  - local
+  - local_async
+  - local_batch
+  - runner
+  - runner_async
+  - wheel
+  - wheel_async
+
+# Who may do what through the API: '.*' = any execution module on any minion, plus the
+# runner (e.g. manage.status), wheel (e.g. key management) and job lookups.
+external_auth:
+  pam:
+    {{ salt_api_user }}:
+      - .*
+      - '@runner'
+      - '@wheel'
+      - '@jobs'
