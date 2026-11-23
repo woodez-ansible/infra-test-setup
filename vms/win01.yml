@@ -1,0 +1,22 @@
+---
+# Example Windows VM spec (Windows Server 2022). Copy to vms/<name>.yml and set vm_name
+# to <name>. Reference only: vm-gitops never builds vms/example*.yml.
+# How-to: build-vm.md A8. Defaults: playbooks/vars/vm_defaults.yml.
+#   ansible-playbook playbooks/vm-build.yml -e @vms/<name>.yml   (manual fallback, A8.7)
+vm_name: win01           # at most 15 characters (Windows computer-name limit)
+vm_os: windows-2022                 # newest golden image (playbooks/windows-image.yml)
+vm_vcpus: 2
+vm_memory_mib: 4096                 # min 2048
+vm_disk_gib: 60                     # min 40; fixed after creation (add vm_extra_disks instead)
+vm_description: "testing"
+# vm_windows_features: [Web-Server] # Windows features/roles (Get-WindowsFeature names)
+# vm_timezone: America/Toronto      # must be in windows_timezone_ids (vm_defaults.yml)
+# vm_extra_disks: [{size_gib: 50}]  # blank disks, left offline/unformatted in Windows
+# vm_mac: "52:54:00:12:34:56"       # default: derived from vm_name (stable per name)
+# vm_autostart: true                # start when compute02 boots
+vm_allow_restart: true            # let a vCPU/RAM/description change restart the VM
+vm_allow_replace: true            # let a MAC change rebuild the VM (disk lost)
+#
+# Not allowed on Windows (Linux only): vm_ubuntu_release, vm_user,
+# vm_ssh_authorized_keys, vm_passwordless_sudo, vm_password_login, vm_packages,
+# vm_apt_upgrade, vm_firmware (Windows is always UEFI)
