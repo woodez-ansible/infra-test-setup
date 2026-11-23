@@ -7,6 +7,10 @@
 - name: Salt minion on Windows VMs
   hosts: windows_vms
   gather_facts: false
+  # Loaded at play level, not with include_vars: ansible_password (group_vars) is templated
+  # before the first task on win01 runs, so a task can't be what defines it.
+  vars_files:
+    - vars/windows-vault.yml        # vault_windows_admin_password
 
   vars:
     salt_version: "3008.5"            # must match the master (playbooks/salt-master.yml)
@@ -20,11 +24,6 @@
     salt_conf_dir: C:\ProgramData\Salt Project\Salt\conf
 
   pre_tasks:
-    - name: Load the Windows admin password from the vault
-      ansible.builtin.include_vars:
-        file: vars/windows-vault.yml
-      no_log: true
-
     - name: Wait for WinRM
       ansible.builtin.wait_for_connection:
         timeout: 120

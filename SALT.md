@@ -72,7 +72,7 @@ ansible-playbook playbooks/salt-minion-windows.yml -l win01
    `test.ping` and reads the minion's OS and Salt version
 
 It needs the Windows admin password from `playbooks/vars/windows-vault.yml` (the playbook
-loads it). Add another Windows VM by listing it under `windows_vms` in
+loads it with `vars_files`). Add another Windows VM by listing it under `windows_vms` in
 `inventory/hosts.yml`. Then, on compute02: `sudo salt win01 test.ping`,
 `sudo salt win01 cmd.run 'hostname'`.
 

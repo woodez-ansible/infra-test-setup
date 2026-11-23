@@ -9,7 +9,8 @@ ansible_winrm_server_cert_validation: ignore   # each VM has its own self-signed
 ansible_winrm_proxy: null       # macOS: avoids a crash in Ansible's forked workers
 ansible_become: false           # the repo's ansible.cfg defaults to sudo
 ansible_user: ansible
-# Defined only once a playbook loads playbooks/vars/windows-vault.yml (include_vars).
+# Defined only when a play loads playbooks/vars/windows-vault.yml with vars_files
+# (include_vars in a task is too late: this is templated before the first task runs).
 # Not stored here: group_vars are read by every play, and a vault in them would be
 # needed for every run.
 ansible_password: "{{ vault_windows_admin_password }}"
