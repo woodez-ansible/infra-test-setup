@@ -76,6 +76,24 @@ loads it with `vars_files`). Add another Windows VM by listing it under `windows
 `inventory/hosts.yml`. Then, on compute02: `sudo salt win01 test.ping`,
 `sudo salt win01 cmd.run 'hostname'`.
 
+### Stop / start a Windows minion
+
+`playbooks/salt-minion-windows-service.yml` stops or starts the `salt-minion` service and
+checks the result **on the VM only** (WinRM; the master is not used to verify). Exactly one
+action per run; anything else fails before changing anything:
+
+```bash
+ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=stop
+ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=start
+```
+
+| Action | Passes when |
+|---|---|
+| `stop` | service `Stopped`, no `salt-minion` process, no TCP connection to 192.168.2.6:4505/4506 (retries ~30 s) |
+| `start` | service `Running` with start mode `Automatic`, `salt-minion` process running, `salt-call --local test.ping` = `True`, `salt-call --local test.version` = 3008.5, and an established connection to 192.168.2.6:4505 (retries ~60 s) |
+
+`stop` leaves the start mode `Automatic`, so the minion comes back after a reboot.
+
 ## Operating it
 
 | Task | How |

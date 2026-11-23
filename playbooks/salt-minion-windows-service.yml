@@ -1,0 +1,131 @@
+---
+# Stop or start salt-minion on Windows VMs and check the result on the VM itself, over
+# WinRM only (the Salt master is not used to verify). One action per run:
+#   ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=stop
+#   ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=start
+# The minion must already be installed (playbooks/salt-minion-windows.yml).
+- name: Stop or start salt-minion on Windows VMs
+  hosts: windows_vms
+  gather_facts: false
+  vars_files:
+    - vars/windows-vault.yml        # vault_windows_admin_password (ansible_password)
+
+  vars:
+    salt_version: "3008.5"          # version start expects (playbooks/salt-minion-windows.yml)
+    salt_master_ip: "{{ hostvars[groups['hypervisors'][0]].ansible_host }}"   # 192.168.2.6
+    salt_call: C:\Program Files\Salt Project\Salt\salt-call.exe
+    # Service state, running salt-minion processes, and established TCP connections from
+    # this VM to the master's ports 4505/4506 (read from the VM's own network table).
+    salt_status_script: |
+      param($MasterIp)
+      $Ansible.Changed = $false
+      $svc = Get-Service -Name salt-minion -ErrorAction Stop
+      $ports = Get-NetTCPConnection -State Established -RemoteAddress $MasterIp -ErrorAction SilentlyContinue |
+        Where-Object RemotePort -in 4505, 4506 |
+        ForEach-Object { [int]$_.RemotePort } | Sort-Object -Unique
+      [pscustomobject]@{
+        state      = $svc.Status.ToString()
+        start_mode = $svc.StartType.ToString()
+        processes  = @(Get-Process -Name salt-minion -ErrorAction SilentlyContinue).Count
+        ports      = @($ports)
+      }
+
+  pre_tasks:
+    - name: Check the action
+      ansible.builtin.assert:
+        that: minion_action | default('') in ['stop', 'start']
+        fail_msg: "Pass exactly one action: -e minion_action=stop or -e minion_action=start"
+        quiet: true
+
+    - name: Wait for WinRM
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+  tasks:
+    # ---------------- stop ----------------
+    - name: Stop salt-minion
+      when: minion_action == 'stop'
+      block:
+        - name: Stop the salt-minion service
+          ansible.windows.win_service:
+            name: salt-minion
+            state: stopped
+
+        - name: Check it is stopped (service stopped, no process, no master connection)
+          ansible.windows.win_powershell:
+            script: "{{ salt_status_script }}"
+            parameters:
+              MasterIp: "{{ salt_master_ip }}"
+          register: status
+          until: >-
+            status.output[0].state == 'Stopped'
+            and status.output[0].processes == 0
+            and status.output[0].ports | length == 0
+          retries: 6
+          delay: 5
+
+        - name: Report
+          ansible.builtin.debug:
+            msg:
+              - "{{ inventory_hostname }}: salt-minion STOPPED"
+              - "service: {{ status.output[0].state }} (start mode {{ status.output[0].start_mode }}; it starts again on reboot)"
+              - "processes: 0, connections to {{ salt_master_ip }}:4505/4506: none"
+
+    # ---------------- start ----------------
+    - name: Start salt-minion
+      when: minion_action == 'start'
+      block:
+        - name: Start the salt-minion service
+          ansible.windows.win_service:
+            name: salt-minion
+            state: started
+
+        - name: Check the service and process are up
+          ansible.windows.win_powershell:
+            script: "{{ salt_status_script }}"
+            parameters:
+              MasterIp: "{{ salt_master_ip }}"
+          register: status
+          until: status.output[0].state == 'Running' and status.output[0].processes > 0
+          retries: 6
+          delay: 5
+
+        - name: Check the service starts automatically
+          ansible.builtin.assert:
+            that: status.output[0].start_mode == 'Automatic'
+            fail_msg: "salt-minion start mode is {{ status.output[0].start_mode }}, expected Automatic"
+            quiet: true
+
+        # --local: runs Salt on the VM without contacting the master
+        - name: salt-call --local test.ping
+          ansible.windows.win_command:
+            argv: ["{{ salt_call }}", --local, --out=json, --log-level=quiet, test.ping]
+          register: local_ping
+          changed_when: false
+          failed_when: local_ping.rc != 0 or (local_ping.stdout | from_json).local is not sameas true
+
+        - name: salt-call --local test.version
+          ansible.windows.win_command:
+            argv: ["{{ salt_call }}", --local, --out=json, --log-level=quiet, test.version]
+          register: local_version
+          changed_when: false
+          failed_when: local_version.rc != 0 or (local_version.stdout | from_json).local != salt_version
+
+        # 4505 is the minion's long-lived subscription to the master; read on the VM
+        - name: Check the minion is connected to the master (port 4505, seen on the VM)
+          ansible.windows.win_powershell:
+            script: "{{ salt_status_script }}"
+            parameters:
+              MasterIp: "{{ salt_master_ip }}"
+          register: status
+          until: 4505 in status.output[0].ports
+          retries: 12
+          delay: 5
+
+        - name: Report
+          ansible.builtin.debug:
+            msg:
+              - "{{ inventory_hostname }}: salt-minion RUNNING and healthy"
+              - "service: {{ status.output[0].state }} (start mode {{ status.output[0].start_mode }}), processes: {{ status.output[0].processes }}"
+              - "salt-call --local: test.ping = {{ (local_ping.stdout | from_json).local }}, version {{ (local_version.stdout | from_json).local }}"
+              - "connected to {{ salt_master_ip }} on port(s) {{ status.output[0].ports | join(', ') }}"
