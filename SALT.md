@@ -52,6 +52,48 @@ Tokens expire after 12 hours (Salt's default). On compute02 itself, the CLI work
 To see the password (terminal only; don't paste it anywhere):
 `ansible-vault view playbooks/vars/salt-vault.yml`.
 
+## Windows minions
+
+`playbooks/salt-minion-windows.yml` installs **salt-minion 3008.5** (same version as the
+master) on the Windows VMs in the `windows_vms` inventory group (`win01`) over WinRM:
+
+```bash
+source .venv/bin/activate
+ansible-playbook playbooks/salt-minion-windows.yml -l win01
+```
+
+1. downloads `Salt-Minion-3008.5-Py3-AMD64.msi` from Salt Project (SHA-256 checked) to
+   `C:\Windows\Temp\salt`
+2. installs it silently with `MASTER=192.168.2.6 MINION_ID=win01` (skipped if the
+   `salt-minion` service already exists)
+3. writes `C:\ProgramData\Salt Project\Salt\conf\minion.d\10-ansible.conf` (master + id),
+   so a later change is applied by re-running; restarts the service only if it changed
+4. on compute02: waits until the master lists `win01` as accepted (auto-accept), then
+   `test.ping` and reads the minion's OS and Salt version
+
+It needs the Windows admin password from `playbooks/vars/windows-vault.yml` (the playbook
+loads it with `vars_files`). Add another Windows VM by listing it under `windows_vms` in
+`inventory/hosts.yml`. Then, on compute02: `sudo salt win01 test.ping`,
+`sudo salt win01 cmd.run 'hostname'`.
+
+### Stop / start a Windows minion
+
+`playbooks/salt-minion-windows-service.yml` stops or starts the `salt-minion` service and
+checks the result **on the VM only** (WinRM; the master is not used to verify). Exactly one
+action per run; anything else fails before changing anything:
+
+```bash
+ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=stop
+ansible-playbook playbooks/salt-minion-windows-service.yml -l win01 -e minion_action=start
+```
+
+| Action | Passes when |
+|---|---|
+| `stop` | service `Stopped`, no `salt-minion` process, no TCP connection to 192.168.2.6:4505/4506 (retries ~30 s) |
+| `start` | service `Running` with start mode `Automatic`, `salt-minion` process running, `salt-call --local test.ping` = `True`, `salt-call --local test.version` = 3008.5, and an established connection to 192.168.2.6:4505 (retries ~60 s) |
+
+`stop` leaves the start mode `Automatic`, so the minion comes back after a reboot.
+
 ## Operating it
 
 | Task | How |
